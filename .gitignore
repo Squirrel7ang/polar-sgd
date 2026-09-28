@@ -11,3 +11,4 @@ __pycache__/
 glue/
 cifar-10-batches-py/
 ._____temp/
+*.egg-info/

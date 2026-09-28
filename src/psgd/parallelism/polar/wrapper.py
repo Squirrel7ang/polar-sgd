@@ -53,6 +53,15 @@ class _NoopProfiler:
         return None
 
 
+def _log_interval(args, default: int = 10) -> int:
+    """每多少步打印一次 step/loss。优先用 --log-interval，非法值退回默认。"""
+    try:
+        value = int(getattr(args, "log_interval", default) or default)
+    except (TypeError, ValueError):
+        value = default
+    return max(1, value)
+
+
 def _polar_step_debug_enabled() -> bool:
     return os.environ.get("POLAR_STEP_DEBUG", "0").lower() in {
         "1",
@@ -1327,7 +1336,7 @@ class PolarParallel:
                     mean_loss = self._mean_dp_loss(loss)
 
                     pbar.set_postfix({"loss": f"{loss.item():.4f}"})
-                    if global_step % 100 == 0:
+                    if global_step % _log_interval(self.args) == 0:
                         print(f"Step {global_step}, Loss: {mean_loss:.4f}")
                 else:
                     self.schedule.step(attention_mask=attention_mask)
@@ -1480,7 +1489,7 @@ class PolarParallel:
                     loss = torch.stack(losses).mean()
 
                     pbar.set_postfix({"loss": f"{loss.item():.4f}"})
-                    if global_step % 100 == 0:
+                    if global_step % _log_interval(self.args) == 0:
                         print(f"Step {global_step}, Loss: {loss.item():.4f}")
                 else:
                     self.schedule.step()
@@ -1618,7 +1627,7 @@ class PolarParallel:
                     loss = torch.stack(losses).mean()
                     mean_loss = self._mean_dp_loss(loss)
                     pbar.set_postfix({"loss": f"{loss.item():.4f}"})
-                    if global_step % 100 == 0:
+                    if global_step % _log_interval(self.args) == 0:
                         print(f"Step {global_step}, Loss: {mean_loss:.4f}")
                 else:
                     schedule.step(attention_mask=attention_mask)
