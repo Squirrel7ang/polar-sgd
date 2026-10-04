@@ -1,4 +1,5 @@
 import os
+import math
 import datetime
 import argparse
 import logging
@@ -106,6 +107,10 @@ def _trace_evidence(component: str, action: str, message: str) -> None:
         f"action={action} {message}",
         flush=True,
     )
+
+
+# batch dict 里这三个 key 由训练循环自己消费，不作为额外输入透传给 stage.forward。
+_RESERVED_BATCH_KEYS = ("input_ids", "labels", "attention_mask")
 
 
 class NativePolarGradientCollector:
@@ -419,13 +424,14 @@ class PolarParallel:
         self._polar_hook_impl = None
         self._init_step_csv()
 
-        print(f"Rank {dist.get_rank()}: Stage {self.stage_idx}, Model layers: {len(self.stage_model.model.layers)}")
+        num_stage_layers = len(self._stage_layer_list())
+        print(f"Rank {dist.get_rank()}: Stage {self.stage_idx}, Model layers: {num_stage_layers}")
         _trace_evidence(
             "PolarParallel",
             "stage_partition",
-            "meaning='this pipeline stage owns this slice of Llama layers' "
+            "meaning='this pipeline stage owns this slice of decoder layers' "
             f"rank={dist.get_rank()} stage={self.stage_idx} "
-            f"num_layers={len(self.stage_model.model.layers)}",
+            f"num_layers={num_stage_layers}",
         )
 
     def _init_step_csv(self) -> None:
@@ -738,6 +744,22 @@ class PolarParallel:
             flush=True,
         )
 
+    def _stage_layer_list(self) -> torch.nn.ModuleList:
+        """本 stage 持有的 decoder 层。
+
+        Qwen2/Llama 是 model.model.layers；Qwen3-VL 这类多模态模型把语言塔放在
+        model.model.language_model.layers。
+        """
+        model = self.stage_model
+        inner = getattr(model, "model", None)
+        if inner is not None:
+            if hasattr(inner, "layers"):
+                return inner.layers
+            language_model = getattr(inner, "language_model", None)
+            if language_model is not None and hasattr(language_model, "layers"):
+                return language_model.layers
+        return torch.nn.ModuleList()
+
     def _reset_module_parameters(self, module: torch.nn.Module) -> None:
         if self._uses_hf_transformer_init:
             if isinstance(module, torch.nn.Linear):
@@ -747,6 +769,21 @@ class PolarParallel:
                 return
             if isinstance(module, torch.nn.Embedding):
                 torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                return
+            # 视觉塔（如 Qwen3-VL 的 Qwen3VLVisionModel）用的是标准 LayerNorm / Conv3d，
+            # 不在上面几类里；漏掉的话 to_empty() 之后这些参数会是未初始化的显存垃圾。
+            if isinstance(module, torch.nn.LayerNorm):
+                if module.weight is not None:
+                    torch.nn.init.ones_(module.weight)
+                if module.bias is not None:
+                    torch.nn.init.zeros_(module.bias)
+                return
+            if isinstance(module, torch.nn.modules.conv._ConvNd):
+                torch.nn.init.kaiming_uniform_(module.weight, a=math.sqrt(5))
+                if module.bias is not None:
+                    fan_in = module.weight.shape[1] * module.weight[0][0].numel()
+                    bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+                    torch.nn.init.uniform_(module.bias, -bound, bound)
                 return
             if module.__class__.__name__.endswith("RMSNorm") and hasattr(module, "weight"):
                 torch.nn.init.ones_(module.weight)
@@ -1311,6 +1348,14 @@ class PolarParallel:
                     else None
                 )
                 attention_mask = batch["attention_mask"].to(self.device)
+                # 多模态等额外输入（pixel_values / image_grid_thw ...）原样透传给各 stage
+                # 的 forward。纯文本 batch 不含这些 key，extra_inputs 为空，行为与以前一致。
+                extra_inputs = {
+                    key: value.to(self.device)
+                    for key, value in batch.items()
+                    if key not in _RESERVED_BATCH_KEYS
+                    and isinstance(value, torch.Tensor)
+                }
                 self._debug_batch(batch_idx, input_ids, labels, attention_mask)
 
                 if self.optimizer:
@@ -1324,13 +1369,13 @@ class PolarParallel:
                 )
                 if self.stage.is_first:
                     self.schedule.step(
-                        input_ids, attention_mask=attention_mask
+                        input_ids, attention_mask=attention_mask, **extra_inputs
                     )
                 elif self.stage.is_last:
                     losses = []
                     self.schedule.step(
                         target=labels, losses=losses,
-                        attention_mask=attention_mask
+                        attention_mask=attention_mask, **extra_inputs
                     )
                     loss = torch.stack(losses).mean()
                     mean_loss = self._mean_dp_loss(loss)
@@ -1339,7 +1384,9 @@ class PolarParallel:
                     if global_step % _log_interval(self.args) == 0:
                         print(f"Step {global_step}, Loss: {mean_loss:.4f}")
                 else:
-                    self.schedule.step(attention_mask=attention_mask)
+                    self.schedule.step(
+                        attention_mask=attention_mask, **extra_inputs
+                    )
                 _polar_step_debug(
                     f"step={global_step} batch={batch_idx} "
                     f"stage={self.stage_idx} schedule.step exit"
