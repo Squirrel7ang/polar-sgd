@@ -504,6 +504,62 @@ class PolarParallel:
             loss_tensor.div_(self.dp_mesh.size())
         return float(loss_tensor.item())
 
+    @staticmethod
+    def _fmt_bytes(num_bytes: float) -> str:
+        if num_bytes >= 1e9:
+            return f"{num_bytes / 1e9:.4f}GB"
+        return f"{num_bytes / 1e6:.4f}MB"
+
+    def _emit_rt_metric(self, step, *, mean_loss, lowbit_group) -> None:
+        """打印一行结构化 metric（DP-PP 重叠率 + DP 通信量降低），供平台实时解析。
+
+        口径与 udtca-config/utils/overlap_interval.py 一致：
+        DP 区间 = DP 梯度同步开始→结束；PP 区间 = 该 iter 流水线开始→结束；
+        重叠率 = |DP∩PP| / (|DP|+|PP|−|DP∩PP|)。
+        """
+        impl = getattr(self, "_polar_hook_impl", None)
+        dp_start = getattr(impl, "dp_window_start_evt", None)
+        dp_end = getattr(impl, "dp_window_end_evt", None)
+        dp_s = pp_s = overtime = None
+        try:
+            # 这个后端上不先 synchronize，cudaEventElapsedTime 会返回
+            # "device not ready"，所以先等步内 GPU 工作全部完成再量事件。
+            torch.cuda.synchronize(self.device)
+            pp_s = self._rt_pp_start.elapsed_time(self._rt_pp_end) / 1000.0
+            dp_s = dp_start.elapsed_time(dp_end) / 1000.0
+            off = self._rt_pp_start.elapsed_time(dp_start) / 1000.0
+            d1, d2 = off, off + dp_s
+            inter = max(0.0, min(d2, pp_s) - max(d1, 0.0))
+            union = dp_s + pp_s - inter
+            overtime = inter / union if union > 0 else 0.0
+        except Exception:
+            overtime = None
+
+        dense_b = comp_b = None
+        if lowbit_group is not None:
+            try:
+                dense_b, comp_b = lowbit_group.transfer_stats()
+            except Exception:
+                dense_b = comp_b = None
+
+        parts = [f"[rt-metric] step={step}"]
+        if mean_loss is not None:
+            parts.append(f"loss={mean_loss:.4f}")
+        if pp_s is not None:
+            parts.append(f"pp_ms={pp_s * 1000.0:.2f}")
+        if dp_s is not None:
+            parts.append(f"dp_ms={dp_s * 1000.0:.2f}")
+        if overtime is not None:
+            parts.append(f"dp_pp_overlap={overtime * 100.0:.1f}%")
+        if dense_b is not None and comp_b is not None:
+            saved = dense_b - comp_b
+            ratio = dense_b / comp_b if comp_b > 0 else float("inf")
+            parts.append(f"comm_dense={self._fmt_bytes(dense_b)}")
+            parts.append(f"comm_compressed={self._fmt_bytes(comp_b)}")
+            parts.append(f"comm_saved={self._fmt_bytes(saved)}")
+            parts.append(f"comm_reduction={ratio:.2f}x")
+        print(" ".join(parts), flush=True)
+
     def _append_step_csv(
         self,
         *,
@@ -1334,6 +1390,35 @@ class PolarParallel:
         grad_clip_norm = float(getattr(self.args, "grad_clip_norm", 1.0))
         run_t0 = time.perf_counter()
 
+        # 运行时每步指标（仅 polar）：DP-PP 重叠率 + DP 通信量降低量。
+        # 在固定 rank（最后一个 stage、dp 局部 rank 0，即 node0）打印一行结构化
+        # metric，供平台实时监测；baseline 不打印。
+        self._rt_metric_rank = bool(
+            self.stage.is_last
+            and self.dp_mesh.get_local_rank() == 0
+            and (self.tp_mesh is None or self.tp_mesh.get_local_rank() == 0)
+        )
+        self._rt_enabled = (
+            using_polar
+            and self._rt_metric_rank
+            and torch.cuda.is_available()
+            and os.environ.get("POLAR_RT_METRICS", "1").lower()
+            not in {"0", "false", "no", "off"}
+        )
+        self._rt_any_rank = using_polar and torch.cuda.is_available()
+        self._rt_pp_start = None
+        self._rt_pp_end = None
+        if self._rt_any_rank:
+            impl = getattr(self, "_polar_hook_impl", None)
+            if impl is not None and hasattr(impl, "attach_dp_window_events"):
+                self._rt_pp_start = torch.cuda.Event(enable_timing=True)
+                self._rt_pp_end = torch.cuda.Event(enable_timing=True)
+                impl.attach_dp_window_events(
+                    torch.cuda.Event(enable_timing=True),
+                    torch.cuda.Event(enable_timing=True),
+                )
+        self._rt_enabled = self._rt_enabled and self._rt_pp_start is not None
+
         with self._profiler_context(self.tensorboard_trace_dir) as prof:
             for batch_idx, batch in enumerate(pbar):
                 if max_steps is not None and batch_idx >= int(max_steps):
@@ -1367,30 +1452,51 @@ class PolarParallel:
                     f"is_first={self.stage.is_first} "
                     f"is_last={self.stage.is_last} schedule.step enter"
                 )
-                if self.stage.is_first:
-                    self.schedule.step(
-                        input_ids, attention_mask=attention_mask, **extra_inputs
-                    )
-                elif self.stage.is_last:
-                    losses = []
-                    self.schedule.step(
-                        target=labels, losses=losses,
-                        attention_mask=attention_mask, **extra_inputs
-                    )
-                    loss = torch.stack(losses).mean()
-                    mean_loss = self._mean_dp_loss(loss)
+                _rt_lbg = getattr(self, "lowbit_group", None)
+                if self._rt_enabled and _rt_lbg is not None:
+                    _rt_lbg.reset_transfer_stats()
+                if self._rt_any_rank and self._rt_pp_start is not None:
+                    self._rt_pp_start.record()
+                # PP 区间：包住整个 schedule.step，并打一个 profiler 标注，
+                # 供 trace 侧（utils/overlap_interval.py）对齐运行时口径。
+                _pp_ctx = (
+                    torch.profiler.record_function("dp_pp_metric/PP")
+                    if self._rt_any_rank
+                    else contextlib.nullcontext()
+                )
+                with _pp_ctx:
+                    if self.stage.is_first:
+                        self.schedule.step(
+                            input_ids, attention_mask=attention_mask, **extra_inputs
+                        )
+                    elif self.stage.is_last:
+                        losses = []
+                        self.schedule.step(
+                            target=labels, losses=losses,
+                            attention_mask=attention_mask, **extra_inputs
+                        )
+                        loss = torch.stack(losses).mean()
+                        mean_loss = self._mean_dp_loss(loss)
 
-                    pbar.set_postfix({"loss": f"{loss.item():.4f}"})
-                    if global_step % _log_interval(self.args) == 0:
-                        print(f"Step {global_step}, Loss: {mean_loss:.4f}")
-                else:
-                    self.schedule.step(
-                        attention_mask=attention_mask, **extra_inputs
-                    )
+                        pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+                        if global_step % _log_interval(self.args) == 0:
+                            print(f"Step {global_step}, Loss: {mean_loss:.4f}")
+                    else:
+                        self.schedule.step(
+                            attention_mask=attention_mask, **extra_inputs
+                        )
+                if self._rt_any_rank and self._rt_pp_end is not None:
+                    self._rt_pp_end.record()
                 _polar_step_debug(
                     f"step={global_step} batch={batch_idx} "
                     f"stage={self.stage_idx} schedule.step exit"
                 )
+                if self._rt_enabled:
+                    self._emit_rt_metric(
+                        global_step,
+                        mean_loss=mean_loss,
+                        lowbit_group=_rt_lbg,
+                    )
 
                 if not using_polar and self.baseline_mode in ("manual", "ddp"):
                     # Dense DP synchronization at the usual DDP point, after

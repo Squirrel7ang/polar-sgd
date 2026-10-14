@@ -13,6 +13,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# profiler 标注名：DP 同步区间 / PP 流水线区间。
+# 运行时每步打印的重叠率和 offline 的 utils/overlap_interval.py 都认这两个标注，
+# 保证两边算的是同一对区间。见 wrapper.PP_ANN（PP 那侧）。
+DP_ANN = "dp_pp_metric/DP"
+
 
 def _polar_hook_debug_enabled() -> bool:
     return os.environ.get("POLAR_HOOK_DEBUG", "0").lower() in {
@@ -1677,6 +1682,52 @@ class PolarGpipeLowMemoryErrorFeedbackHook:
             else None
         )
 
+        # 运行时 DP 同步窗口（供训练侧算 DP-PP 重叠率）：在 comm stream 上记录
+        # DP 梯度同步的起止（开始发 bucket → 最后一个 bucket 归约完成）。
+        # 同一对点还会开一个 profiler 标注（dp_pp_metric/DP），供 trace 侧对齐。
+        self.dp_window_start_evt: Optional[torch.cuda.Event] = None
+        self.dp_window_end_evt: Optional[torch.cuda.Event] = None
+        self._dp_window_active = False
+        self._dp_rf = None
+
+    def attach_dp_window_events(self, start_evt, end_evt) -> None:
+        """由训练循环注入一对 CUDA event，hook 每步记录 DP 同步区间。"""
+        self.dp_window_start_evt = start_evt
+        self.dp_window_end_evt = end_evt
+        self._dp_window_active = False
+        self._dp_rf = None
+
+    def _mark_dp_window_start(self) -> None:
+        if self._dp_window_active or self.dp_window_start_evt is None:
+            return
+        self._dp_window_active = True
+        try:
+            # profiler 标注：与下面 CUDA event 打在同一时刻（跨多次 hook 调用 push/pop）
+            self._dp_rf = torch.profiler.record_function(DP_ANN)
+            self._dp_rf.__enter__()
+            if self.comm_stream is not None:
+                self.dp_window_start_evt.record(self.comm_stream)
+            else:
+                self.dp_window_start_evt.record()
+        except Exception:  # pragma: no cover - 记账不能影响训练
+            pass
+
+    def _mark_dp_window_end(self) -> None:
+        if not self._dp_window_active or self.dp_window_end_evt is None:
+            return
+        self._dp_window_active = False
+        try:
+            # end 也记在 comm stream 上，DP 区间才是这条流的真实跨度
+            if self.comm_stream is not None:
+                self.dp_window_end_evt.record(self.comm_stream)
+            else:
+                self.dp_window_end_evt.record()
+            if self._dp_rf is not None:
+                self._dp_rf.__exit__(None, None, None)
+                self._dp_rf = None
+        except Exception:  # pragma: no cover - 记账不能影响训练
+            pass
+
     @staticmethod
     def _local_tensor(tensor: torch.Tensor) -> torch.Tensor:
         if hasattr(tensor, "to_local"):
@@ -1961,6 +2012,7 @@ class PolarGpipeLowMemoryErrorFeedbackHook:
     @torch.no_grad()
     def _bucketed_all_reduce_(self) -> None:
         self._log_bucket_schema_once()
+        self._mark_dp_window_start()
         inflight: List[_InflightBucket] = []
 
         for entries in self.buckets:
@@ -2202,6 +2254,7 @@ class PolarGpipeLowMemoryErrorFeedbackHook:
     @torch.no_grad()
     def _bucketed_predict_to_cpu_(self) -> None:
         self._log_bucket_schema_once()
+        self._mark_dp_window_start()
         if not self._logged_predict_trigger:
             logger.info(
                 "[polar-hook] ef_lowmem POLAR trigger: bucketed predicted "
@@ -2348,6 +2401,7 @@ class PolarGpipeLowMemoryErrorFeedbackHook:
                     "ef_lowmem hook final path returned "
                     f"elapsed_ms={(time.perf_counter() - t_finish) * 1000.0:.3f}"
                 )
+                self._mark_dp_window_end()
                 self.micro_batch_counter = 0
                 self.comm_handle = None
         finally:
