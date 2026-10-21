@@ -154,9 +154,65 @@ def _all_reduce_flat_async(
     return work
 
 
+def _comm_call_timeout_s() -> float:
+    try:
+        return float(os.environ.get("UDTCA_COMM_WATCHDOG_S", "120"))
+    except (TypeError, ValueError):
+        return 120.0
+
+
+def _work_is_completed(work) -> Optional[bool]:
+    if work is None:
+        return True
+    fn = getattr(work, "is_completed", None) or getattr(work, "isCompleted", None)
+    if fn is None:
+        return None
+    try:
+        return bool(fn())
+    except Exception:
+        return None
+
+
+def _wait_work_with_timeout(work, tag: str) -> None:
+    """Wait for a bitscom/NCCL Work, aborting instead of hanging forever."""
+    if work is None:
+        return
+    timeout_s = _comm_call_timeout_s()
+    if timeout_s <= 0:
+        work.wait()
+        return
+    deadline = time.monotonic() + timeout_s
+    while True:
+        done = _work_is_completed(work)
+        if done is None:
+            # Work type without completion polling (e.g. thread-backed launch).
+            work.wait()
+            return
+        if done:
+            break
+        if time.monotonic() > deadline:
+            try:
+                rank = dist.get_rank() if dist.is_initialized() else -1
+            except Exception:
+                rank = -1
+            print(
+                f"[comm-watchdog] INTERNAL_TIMEOUT rank={rank} pid={os.getpid()} "
+                f"op={tag} timeout={timeout_s:.1f}s",
+                flush=True,
+            )
+            try:
+                dist.abort()
+            except Exception as exc:
+                print(f"[comm-watchdog] dist.abort() failed: {exc!r}", flush=True)
+            time.sleep(2.0)
+            os._exit(3)
+        time.sleep(0.02)
+    work.wait()
+
+
 def _wait_and_average_flat(work, tensor: torch.Tensor, group) -> None:
     if work is not None:
-        work.wait()
+        _wait_work_with_timeout(work, "flat_dp_allreduce")
     if getattr(work, "_polar_already_averaged", False):
         return
     world_size = dist.get_world_size(group)

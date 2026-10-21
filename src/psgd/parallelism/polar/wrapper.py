@@ -6,6 +6,7 @@ import logging
 import contextlib
 import csv
 import time
+import threading
 # from turtle import back
 import numpy as np
 
@@ -45,6 +46,80 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+
+# ---- NCCL communication watchdog (internal timeout, added 2026-10-21) ----
+# A hung collective/P2P has no timeout in NCCL; without this, an external
+# interruption would kill ranks with communications in flight. The watchdog
+# aborts all process groups on every rank when training stops making progress,
+# then exits with code 3 so the launcher can report INTERNAL_TIMEOUT.
+COMM_WATCHDOG_TIMEOUT_S = float(os.environ.get("UDTCA_COMM_WATCHDOG_S", "120"))
+
+
+class _CommWatchdog:
+    def __init__(self, timeout_s, poll_s=1.0, grace_s=2.0):
+        self.timeout_s = timeout_s
+        self.poll_s = poll_s
+        self.grace_s = grace_s
+        self._last = time.monotonic()
+        self._tag = "startup"
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name="comm-watchdog", daemon=True
+        )
+
+    def start(self):
+        self._thread.start()
+
+    def beat(self, tag=""):
+        self._last = time.monotonic()
+        self._tag = tag
+
+    def stop(self):
+        self._stop_event.set()
+
+    def _run(self):
+        while not self._stop_event.wait(self.poll_s):
+            idle = time.monotonic() - self._last
+            if idle < self.timeout_s:
+                continue
+            try:
+                rank = dist.get_rank() if dist.is_initialized() else -1
+            except Exception:
+                rank = -1
+            print(
+                f"[comm-watchdog] INTERNAL_TIMEOUT rank={rank} pid={os.getpid()} "
+                f"idle={idle:.1f}s timeout={self.timeout_s:.1f}s "
+                f"last_tag={self._tag}",
+                flush=True,
+            )
+            try:
+                dist.abort()
+                print("[comm-watchdog] dist.abort() returned", flush=True)
+            except Exception as exc:
+                print(f"[comm-watchdog] dist.abort() failed: {exc!r}", flush=True)
+            time.sleep(self.grace_s)
+            os._exit(3)
+
+
+_COMM_WATCHDOG = None
+
+
+def _start_comm_watchdog():
+    global _COMM_WATCHDOG
+    if COMM_WATCHDOG_TIMEOUT_S <= 0:
+        return None
+    _COMM_WATCHDOG = _CommWatchdog(COMM_WATCHDOG_TIMEOUT_S)
+    _COMM_WATCHDOG.start()
+    logging.getLogger(__name__).info(
+        "comm watchdog started: timeout=%.0fs", COMM_WATCHDOG_TIMEOUT_S
+    )
+    return _COMM_WATCHDOG
+
+
+def _comm_watchdog_beat(tag):
+    if _COMM_WATCHDOG is not None:
+        _COMM_WATCHDOG.beat(tag)
 
 POLAR_WRAPPER_FIX_VERSION = "llama_init_broadcast_debug_v1"
 
@@ -1389,6 +1464,8 @@ class PolarParallel:
 
         grad_clip_norm = float(getattr(self.args, "grad_clip_norm", 1.0))
         run_t0 = time.perf_counter()
+        _comm_watchdog = _start_comm_watchdog()
+        _comm_watchdog_beat("train_loop_start")
 
         # 运行时每步指标（仅 polar）：DP-PP 重叠率 + DP 通信量降低量。
         # 在固定 rank（最后一个 stage、dp 局部 rank 0，即 node0）打印一行结构化
@@ -1446,6 +1523,9 @@ class PolarParallel:
                 if self.optimizer:
                     self.optimizer.zero_grad()
 
+                _comm_watchdog_beat(
+                    f"step={global_step} batch={batch_idx} schedule.step"
+                )
                 _polar_step_debug(
                     f"step={global_step} batch={batch_idx} "
                     f"stage={self.stage_idx} "
@@ -1489,7 +1569,12 @@ class PolarParallel:
                     self._rt_pp_end.record()
                 _polar_step_debug(
                     f"step={global_step} batch={batch_idx} "
-                    f"stage={self.stage_idx} schedule.step exit"
+                    f"stage={self.stage_idx} "
+                    f"is_first={self.stage.is_first} "
+                    f"is_last={self.stage.is_last} schedule.step exit"
+                )
+                _comm_watchdog_beat(
+                    f"step={global_step} batch={batch_idx} schedule.step done"
                 )
                 if self._rt_enabled:
                     self._emit_rt_metric(
@@ -1528,6 +1613,7 @@ class PolarParallel:
                     )
 
                 self.optimizer.step()
+                _comm_watchdog_beat(f"step={global_step} optimizer_step")
                 debug_steps = int(getattr(self.args, "debug_nan_steps", 0) or 0)
                 if global_step == 0 or batch_idx < debug_steps:
                     self._log_stage_memory_and_params(
@@ -1587,6 +1673,8 @@ class PolarParallel:
 
         if self.use_local_sgd and self.local_sgd_mode == "streaming":
             self._finish_parameters_local_sgd_async()
+        if _comm_watchdog is not None:
+            _comm_watchdog.stop()
 
     def train_test(self):
         self.stage.submod.register_full_backward_hook(GpipeHook(
