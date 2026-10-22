@@ -173,15 +173,59 @@ def _work_is_completed(work) -> Optional[bool]:
         return None
 
 
+def _nccl_revoke():
+    """Import the shared revoke/shutdown helpers (experiments/qwen14b)."""
+    import sys as _sys
+
+    _revoke_dir = os.environ.get(
+        "UDTCA_REVOKE_PY_DIR", "/data/tangruijing/udtca/experiments/qwen14b"
+    )
+    if _revoke_dir not in _sys.path:
+        _sys.path.insert(0, _revoke_dir)
+    import nccl_revoke
+
+    return nccl_revoke
+
+
+def _revoke_requested() -> bool:
+    """True once any rank of this node has started rolling the job back."""
+    try:
+        return _nccl_revoke().revoke_requested()
+    except Exception:
+        return False
+
+
+def _rollback_and_exit(reason: str) -> None:
+    """Revoke locally and exit once the node is quiescent (never a signal).
+
+    Returns only if the rollback cannot be coordinated; callers then keep the
+    process alive instead of exiting underneath their peers.
+    """
+    try:
+        _nccl_revoke().coordinated_shutdown(
+            reason,
+            exit_code=3,
+            device_index=int(os.environ.get("LOCAL_RANK", "0")),
+            quiesce_timeout_s=float(os.environ.get("UDTCA_REVOKE_QUIESCE_S", "20")),
+        )
+    except Exception as exc:
+        print(f"[comm-watchdog] rollback unavailable: {exc!r}", flush=True)
+
+
 def _wait_work_with_timeout(work, tag: str) -> None:
-    """Wait for a bitscom/NCCL Work, aborting instead of hanging forever."""
+    """Wait for a bitscom/NCCL Work; a hang rolls the job back and exits.
+
+    The timeout is internal: each rank revokes its own comms and then waits
+    until every local rank is quiescent before exiting, so no peer is ever
+    interrupted mid-collective (that is what causes XID 24). A peer that
+    starts the rollback for any reason also drags this rank into it.
+    """
     if work is None:
         return
     timeout_s = _comm_call_timeout_s()
-    if timeout_s <= 0:
-        work.wait()
-        return
-    deadline = time.monotonic() + timeout_s
+    deadline = time.monotonic() + timeout_s if timeout_s > 0 else None
+    next_peer_check = time.monotonic() + 1.0
+    timed_out = False
     while True:
         done = _work_is_completed(work)
         if done is None:
@@ -190,7 +234,13 @@ def _wait_work_with_timeout(work, tag: str) -> None:
             return
         if done:
             break
-        if time.monotonic() > deadline:
+        now = time.monotonic()
+        if now >= next_peer_check:
+            next_peer_check = now + 1.0
+            if _revoke_requested():
+                _rollback_and_exit(f"peer rank requested revoke while waiting for {tag}")
+        if deadline is not None and now > deadline and not timed_out:
+            timed_out = True
             try:
                 rank = dist.get_rank() if dist.is_initialized() else -1
             except Exception:
@@ -200,12 +250,10 @@ def _wait_work_with_timeout(work, tag: str) -> None:
                 f"op={tag} timeout={timeout_s:.1f}s",
                 flush=True,
             )
-            try:
-                dist.abort()
-            except Exception as exc:
-                print(f"[comm-watchdog] dist.abort() failed: {exc!r}", flush=True)
-            time.sleep(2.0)
-            os._exit(3)
+            _rollback_and_exit(f"{tag} timeout after {timeout_s:.1f}s")
+            # Rollback could not be coordinated: never exit underneath peers.
+            work.wait()
+            return
         time.sleep(0.02)
     work.wait()
 
@@ -624,7 +672,9 @@ class PolarCommHook:
                 ]
                 for layer_g, layer_p in zip(self.grads[self.partition_id], self.grads_pred[self.partition_id])
             ]
-            self.comm_works[self.partition_id].wait()
+            _wait_work_with_timeout(
+                self.comm_works[self.partition_id], "partition_broadcast"
+            )
             # self.comm_end_event.wait(stream=torch.cuda.default_stream())
             # self.comm_end_event.synchronize()
             self.grads_pred[self.partition_id] = self.unflatten_nested_tensor_list(
@@ -1644,7 +1694,7 @@ class PolarGpipeFullAsyncLaunchHook(PolarGpipeErrorFeedbackOnlyHook):
 
     def reset_state(self) -> None:
         if self.comm_handle is not None:
-            self.comm_handle.wait()
+            _wait_work_with_timeout(self.comm_handle, "reset_state_dp")
         for i in range(len(self.grads)):
             self.grads[i] = None
             self.grads_pred[i] = None

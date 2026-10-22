@@ -49,11 +49,28 @@ logger = logging.getLogger(__name__)
 
 
 # ---- NCCL communication watchdog (internal timeout, added 2026-10-21) ----
-# A hung collective/P2P has no timeout in NCCL; without this, an external
-# interruption would kill ranks with communications in flight. The watchdog
-# aborts all process groups on every rank when training stops making progress,
-# then exits with code 3 so the launcher can report INTERNAL_TIMEOUT.
-COMM_WATCHDOG_TIMEOUT_S = float(os.environ.get("UDTCA_COMM_WATCHDOG_S", "120"))
+# A hung collective/P2P has no timeout in NCCL. On timeout we roll the job
+# back ourselves instead of waiting for an external signal: revoke this rank's
+# local NCCL comms (ncclCommRevoke), wait until every local rank is quiescent,
+# then each process exits on its own (see nccl_revoke.coordinated_shutdown).
+# The ordering matters: exiting while a peer still has a collective in flight
+# interrupts it and corrupts the GPU VA space (XID 24).
+COMM_WATCHDOG_TIMEOUT_S = float(os.environ.get("UDTCA_COMM_WATCHDOG_S", "60"))
+_CAPTURE_INTERVAL_S = 5.0
+
+
+def _nccl_revoke():
+    """Import the shared revoke/shutdown helpers (experiments/qwen14b)."""
+    import sys as _sys
+
+    _revoke_dir = os.environ.get(
+        "UDTCA_REVOKE_PY_DIR", "/data/tangruijing/udtca/experiments/qwen14b"
+    )
+    if _revoke_dir not in _sys.path:
+        _sys.path.insert(0, _revoke_dir)
+    import nccl_revoke
+
+    return nccl_revoke
 
 
 class _CommWatchdog:
@@ -64,6 +81,11 @@ class _CommWatchdog:
         self._last = time.monotonic()
         self._tag = "startup"
         self._stop_event = threading.Event()
+        self._fired = False
+        # CUDA current device is thread-local: record it on the main thread.
+        self._device_index = int(os.environ.get("LOCAL_RANK", "0"))
+        self._comms = []
+        self._last_capture = 0.0
         self._thread = threading.Thread(
             target=self._run, name="comm-watchdog", daemon=True
         )
@@ -71,35 +93,76 @@ class _CommWatchdog:
     def start(self):
         self._thread.start()
 
+    def _capture(self):
+        """Snapshot NCCL comm pointers on the main thread, never on the watchdog."""
+        now = time.monotonic()
+        if now - self._last_capture < _CAPTURE_INTERVAL_S:
+            return
+        self._last_capture = now
+        try:
+            nccl_revoke = _nccl_revoke()
+
+            comms = nccl_revoke._nccl_comms(self._device_index)
+            if comms:
+                self._comms = comms
+        except Exception as exc:
+            print(f"[comm-watchdog] comm capture failed: {exc!r}", flush=True)
+
     def beat(self, tag=""):
         self._last = time.monotonic()
         self._tag = tag
+        self._capture()
 
     def stop(self):
         self._stop_event.set()
 
     def _run(self):
         while not self._stop_event.wait(self.poll_s):
+            if self._fired:
+                return
+            try:
+                nccl_revoke = _nccl_revoke()
+                peer_revoke = nccl_revoke.revoke_requested()
+            except Exception:
+                nccl_revoke = None
+                peer_revoke = False
             idle = time.monotonic() - self._last
-            if idle < self.timeout_s:
+            if not peer_revoke and idle < self.timeout_s:
                 continue
             try:
                 rank = dist.get_rank() if dist.is_initialized() else -1
             except Exception:
                 rank = -1
+            if peer_revoke:
+                reason = f"peer rank requested revoke (last_tag={self._tag})"
+            else:
+                reason = f"no progress for {idle:.1f}s (last_tag={self._tag})"
             print(
                 f"[comm-watchdog] INTERNAL_TIMEOUT rank={rank} pid={os.getpid()} "
-                f"idle={idle:.1f}s timeout={self.timeout_s:.1f}s "
-                f"last_tag={self._tag}",
+                f"{reason} timeout={self.timeout_s:.1f}s",
                 flush=True,
             )
+            if nccl_revoke is None:
+                # No revoke backend: exiting could wedge peers, so stay alive.
+                print("[comm-watchdog] nccl_revoke unavailable; not exiting", flush=True)
+                self._fired = True
+                return
+            # Revoke locally, wait for the other local ranks to be quiescent,
+            # then exit. coordinated_shutdown never returns normally.
             try:
-                dist.abort()
-                print("[comm-watchdog] dist.abort() returned", flush=True)
+                nccl_revoke.coordinated_shutdown(
+                    reason,
+                    exit_code=3,
+                    device_index=self._device_index,
+                    quiesce_timeout_s=float(
+                        os.environ.get("UDTCA_REVOKE_QUIESCE_S", "20")
+                    ),
+                    comms=self._comms or None,
+                )
             except Exception as exc:
-                print(f"[comm-watchdog] dist.abort() failed: {exc!r}", flush=True)
-            time.sleep(self.grace_s)
-            os._exit(3)
+                print(f"[comm-watchdog] shutdown failed: {exc!r}", flush=True)
+            self._fired = True
+            return
 
 
 _COMM_WATCHDOG = None
@@ -120,6 +183,7 @@ def _start_comm_watchdog():
 def _comm_watchdog_beat(tag):
     if _COMM_WATCHDOG is not None:
         _COMM_WATCHDOG.beat(tag)
+
 
 POLAR_WRAPPER_FIX_VERSION = "llama_init_broadcast_debug_v1"
 
