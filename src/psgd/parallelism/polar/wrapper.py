@@ -1660,7 +1660,8 @@ class PolarParallel:
                     self._clear_polar_residual_state_()
                     if self.stage.is_last:
                         print(
-                            f"[warn] non-finite gradients at step {global_step}; "
+                            f"[warn] non-finite gradients at step {global_step} "
+                            f"rank={dist.get_rank()} stage={self.stage_idx}; "
                             f"skip optimizer step; cleared POLAR residual state; "
                             f"first_bad={bad_name} bad_count={bad_count} "
                             f"max_abs={bad_max_abs:.6g}",
@@ -1948,7 +1949,8 @@ class PolarParallel:
                     self._clear_polar_residual_state_()
                     if baseline_stage.is_last:
                         print(
-                            f"[warn] non-finite gradients at step {global_step}; "
+                            f"[warn] non-finite gradients at step {global_step} "
+                            f"rank={dist.get_rank()} stage={self.stage_idx}; "
                             f"skip optimizer step; cleared POLAR residual state; "
                             f"first_bad={bad_name} bad_count={bad_count} "
                             f"max_abs={bad_max_abs:.6g}",
