@@ -55,7 +55,11 @@ logger = logging.getLogger(__name__)
 # then each process exits on its own (see nccl_revoke.coordinated_shutdown).
 # The ordering matters: exiting while a peer still has a collective in flight
 # interrupts it and corrupts the GPU VA space (XID 24).
-COMM_WATCHDOG_TIMEOUT_S = float(os.environ.get("UDTCA_COMM_WATCHDOG_S", "60"))
+# Heartbeats are only taken at step boundaries, so this must stay well above
+# the slowest legitimate step (1 gbit tc: ~40-65 s measured). 300 s keeps a
+# 5x margin and still turns a genuinely hung collective into a rollback in
+# minutes.
+COMM_WATCHDOG_TIMEOUT_S = float(os.environ.get("UDTCA_COMM_WATCHDOG_S", "300"))
 _CAPTURE_INTERVAL_S = 5.0
 
 
@@ -145,24 +149,31 @@ class _CommWatchdog:
             if nccl_revoke is None:
                 # No revoke backend: exiting could wedge peers, so stay alive.
                 print("[comm-watchdog] nccl_revoke unavailable; not exiting", flush=True)
-                self._fired = True
-                return
+                self._last = time.monotonic()
+                continue
             # Revoke locally, wait for the other local ranks to be quiescent,
-            # then exit. coordinated_shutdown never returns normally.
+            # then exit. On success it never returns; if the comms cannot be
+            # cancelled it returns and we retry after another timeout instead
+            # of exiting with collectives still in flight (XID 24).
             try:
                 nccl_revoke.coordinated_shutdown(
                     reason,
                     exit_code=3,
                     device_index=self._device_index,
                     quiesce_timeout_s=float(
-                        os.environ.get("UDTCA_REVOKE_QUIESCE_S", "20")
+                        os.environ.get("UDTCA_REVOKE_QUIESCE_S", "10")
                     ),
                     comms=self._comms or None,
                 )
+                print(
+                    "[comm-watchdog] rollback deferred: no comm could be "
+                    "cancelled; process stays alive and will retry",
+                    flush=True,
+                )
             except Exception as exc:
                 print(f"[comm-watchdog] shutdown failed: {exc!r}", flush=True)
-            self._fired = True
-            return
+            self._last = time.monotonic()
+            continue
 
 
 _COMM_WATCHDOG = None
@@ -1259,10 +1270,13 @@ class PolarParallel:
             return value
         return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
-    def _allreduce_dp_grads_(self):
+    def _allreduce_dp_grads_(self, lowbit_group=None):
         """All-reduce grads across the DP group (SUM then average).
 
-        Intended for baseline_mode='manual' (no DDP).
+        Intended for baseline_mode='manual' (no DDP). With ``lowbit_group``
+        set the same per-parameter loop goes through the bitscom lowbit
+        backend; SUM and the averaging stay identical, so the two variants
+        differ only in whether the gradient sync is quantized.
         """
         dp_group = self.dp_mesh.get_group()
         dp_size = self.dp_mesh.size()
@@ -1274,8 +1288,17 @@ class PolarParallel:
             grad = p.grad
             if hasattr(grad, "to_local"):
                 grad = grad.to_local()
-            dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=dp_group)
-            grad.div_(dp_size)
+            if lowbit_group is None:
+                dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=dp_group)
+                grad.div_(dp_size)
+                continue
+            # The lowbit backend packs in place, so it needs a contiguous
+            # buffer; copy back when the gradient was a strided view.
+            buf = grad if grad.is_contiguous() else grad.contiguous()
+            lowbit_group.all_reduce(buf, op=dist.ReduceOp.SUM)
+            buf.div_(dp_size)
+            if buf is not grad:
+                grad.copy_(buf)
 
     @torch.no_grad()
     def _evaluate_val_loss_ppl(self):
@@ -1648,9 +1671,12 @@ class PolarParallel:
                     )
 
                 if not using_polar and self.baseline_mode in ("manual", "ddp"):
-                    # Dense DP synchronization at the usual DDP point, after
-                    # 1F1B backward has completed for this pipeline stage.
-                    self._allreduce_dp_grads_()
+                    # DP synchronization at the usual DDP point, after 1F1B
+                    # backward has completed for this pipeline stage. Only the
+                    # transport changes when lowbit_group is present.
+                    self._allreduce_dp_grads_(
+                        getattr(self, "lowbit_group", None)
+                    )
 
                 bad_grad = self._find_nonfinite_grad(self.stage.submod)
                 if bad_grad is not None:
