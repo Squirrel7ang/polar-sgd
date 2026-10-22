@@ -1743,6 +1743,9 @@ class PolarGpipeLowMemoryErrorFeedbackHook:
         self.lowbit_group = lowbit_group
         self.bucket_numel = max(1, int(bucket_numel))
         self.max_inflight_buckets = max(1, int(max_inflight_buckets))
+        self.serial_buckets = os.environ.get(
+            "POLAR_EF_LOWMEM_SERIAL_BUCKETS", "0"
+        ).lower() in {"1", "true", "yes", "on"}
 
         self.params: List[torch.nn.Parameter] = [
             p for p in self.model.parameters()
@@ -2261,6 +2264,22 @@ class PolarGpipeLowMemoryErrorFeedbackHook:
             or self.next_pred_bucket_idx is None
         ):
             return
+
+        if self.serial_buckets:
+            # Strict send-order serialization: never post phase1 of a new
+            # bucket until the previous one is fully restored. Keeps the
+            # opCount order identical on both DP ranks (the lowbit comm is
+            # shared by phase1/phase2 on different streams).
+            while (
+                self.pending_pred_buckets
+                and len(self.pending_pred_buckets) >= self.max_inflight_buckets
+            ):
+                inflight = self.pending_pred_buckets.pop(0)
+                _polar_hook_timing(
+                    "ef_lowmem serial drain enter "
+                    f"pending={len(self.pending_pred_buckets)}"
+                )
+                self._finish_pred_bucket_to_cpu_(inflight)
 
         launches = 0
         while (
