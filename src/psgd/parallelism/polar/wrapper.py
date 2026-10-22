@@ -55,10 +55,7 @@ logger = logging.getLogger(__name__)
 # then each process exits on its own (see nccl_revoke.coordinated_shutdown).
 # The ordering matters: exiting while a peer still has a collective in flight
 # interrupts it and corrupts the GPU VA space (XID 24).
-# Heartbeats are only taken at step boundaries, so this must stay well above
-# the slowest legitimate step (1 gbit tc: ~40-65 s measured). 300 s keeps a
-# 5x margin and still turns a genuinely hung collective into a rollback in
-# minutes.
+# Heartbeats are only taken at step boundaries; a 1 gbit tc step takes 40-65 s.
 COMM_WATCHDOG_TIMEOUT_S = float(os.environ.get("UDTCA_COMM_WATCHDOG_S", "300"))
 _CAPTURE_INTERVAL_S = 5.0
 
@@ -68,7 +65,7 @@ def _nccl_revoke():
     import sys as _sys
 
     _revoke_dir = os.environ.get(
-        "UDTCA_REVOKE_PY_DIR", "/data/tangruijing/udtca/experiments/qwen14b"
+        "UDTCA_REVOKE_PY_DIR", "/data1/tangruijing/udtca/experiments/qwen14b"
     )
     if _revoke_dir not in _sys.path:
         _sys.path.insert(0, _revoke_dir)
