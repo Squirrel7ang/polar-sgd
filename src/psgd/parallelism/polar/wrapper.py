@@ -47,6 +47,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+def _wall_clock() -> str:
+    """墙上时钟（本地时区，毫秒），用来和 dmesg / NCCL 日志对齐。"""
+    now = time.time()
+    return time.strftime("%m-%d %H:%M:%S", time.localtime(now)) + f".{int((now % 1) * 1000):03d}"
+
+
 
 # ---- NCCL communication watchdog (internal timeout, added 2026-10-21) ----
 # A hung collective/P2P has no timeout in NCCL. On timeout we roll the job
@@ -107,7 +113,7 @@ class _CommWatchdog:
             if comms:
                 self._comms = comms
         except Exception as exc:
-            print(f"[comm-watchdog] comm capture failed: {exc!r}", flush=True)
+            print(f"[comm-watchdog] {_wall_clock()} comm capture failed: {exc!r}", flush=True)
 
     def beat(self, tag=""):
         self._last = time.monotonic()
@@ -145,7 +151,7 @@ class _CommWatchdog:
             )
             if nccl_revoke is None:
                 # No revoke backend: exiting could wedge peers, so stay alive.
-                print("[comm-watchdog] nccl_revoke unavailable; not exiting", flush=True)
+                print(f"[comm-watchdog] {_wall_clock()} nccl_revoke unavailable; not exiting", flush=True)
                 self._last = time.monotonic()
                 continue
             # Revoke locally, wait for the other local ranks to be quiescent,
@@ -168,7 +174,7 @@ class _CommWatchdog:
                     flush=True,
                 )
             except Exception as exc:
-                print(f"[comm-watchdog] shutdown failed: {exc!r}", flush=True)
+                print(f"[comm-watchdog] {_wall_clock()} shutdown failed: {exc!r}", flush=True)
             self._last = time.monotonic()
             continue
 
@@ -1156,7 +1162,53 @@ class PolarParallel:
         # must be identical across POLAR DP replicas; leave buffers local.
         dist.barrier(group=dp_group)
 
+    def _diag_sync_probe(self, module: torch.nn.Module) -> None:
+        """[syncprobe] 验证 isfinite(...).all().item() 的标量读回是否可靠。"""
+        rank = dist.get_rank()
+        name, g = None, None
+        for n, p in module.named_parameters():
+            if p.grad is None:
+                continue
+            t = p.grad
+            if hasattr(t, "to_local"):
+                t = t.to_local()
+            name, g = n, t
+            break
+        if g is None:
+            return
+        try:
+            torch.cuda.synchronize()                      # 全设备同步，不只是流
+            stream = torch.cuda.current_stream().cuda_stream
+            verdicts = [bool(torch.isfinite(g).all().item()) for _ in range(10)]
+            sums = [int((~torch.isfinite(g)).sum().item()) for _ in range(3)]
+            torch.cuda.synchronize()
+            suspicious = (not all(verdicts)) or any(sums) or len(set(verdicts)) > 1
+            extra = ""
+            if suspicious:                                # 可疑才做昂贵的 CPU 复核
+                cpu = g.detach().float().cpu()
+                extra = (f" cpu_allfinite={bool(torch.isfinite(cpu).all().item())}"
+                         f" cpu_notfinite={int((~torch.isfinite(cpu)).sum().item())}")
+                del cpu
+            print(
+                f"[diag][syncprobe] rank={rank} stage={self.stage_idx} name={name} "
+                f"stream={stream} dtype={g.dtype} numel={g.numel()} "
+                f"contiguous={g.is_contiguous()} offset={g.storage_offset()} "
+                f"stride={tuple(g.stride())[:4]} "
+                f"verdicts={verdicts} notfinite_sums={sums}{extra}",
+                flush=True,
+            )
+        except Exception as exc:
+            print(f"[diag][syncprobe] failed: {exc!r}", flush=True)
+
     def _find_nonfinite_grad(self, module: torch.nn.Module):
+        # [syncprobe] 诊断优先于跳过：即使检查已关，也每步记一次标量读回是否可靠
+        if os.environ.get("UDTCA_DIAG_SYNCCHECK", "0") == "1":
+            self._diag_sync_probe(module)
+        # [disable_gradcheck] 该检查在 Corex 上对 vLLM 大小的 embed grad 会误报
+        # （同一 tensor 连读两次判定了不同结果），且误报走 continue 会跳过
+        # step-boundary barrier 把整个 32 卡作业锁死。默认关闭。
+        if os.environ.get("UDTCA_SKIP_GRADCHECK", "1") == "1":
+            return None
         for name, p in module.named_parameters():
             if p.grad is None:
                 continue
@@ -1169,6 +1221,70 @@ class PolarParallel:
                 max_abs = float(grad.detach().nan_to_num().abs().max().item())
                 return name, bad_count, max_abs
         return None
+
+    def _diag_param_digest(self, module: torch.nn.Module) -> None:
+        """step0/batch0：打印本 rank 每个参数 grad 的数字指纹，供跨 rank 对比。"""
+        if os.environ.get("UDTCA_DIAG_DIGEST", "1") == "0":
+            return
+        rank = dist.get_rank()
+        for name, p in module.named_parameters():
+            g = p.grad
+            if g is None:
+                print(f"[diag][digest] rank={rank} {name} grad=None", flush=True)
+                continue
+            if hasattr(g, "to_local"):
+                g = g.to_local()
+            gf = g.detach().float()
+            print(
+                f"[diag][digest] rank={rank} {name} numel={gf.numel()} "
+                f"nan={int(torch.isnan(gf).sum())} inf={int(torch.isinf(gf).sum())} "
+                f"absmax={gf.nan_to_num().abs().max().item():.6g} "
+                f"abssum={gf.nan_to_num().abs().sum().item():.6g} "
+                f"w_absmax={p.detach().float().abs().max().item():.6g}",
+                flush=True,
+            )
+
+    def _diag_dump_bad_grad(self, module: torch.nn.Module, bad_name: str, tag: str) -> None:
+        """把出问题的那个参数的 grad / weight 落盘并打印 inf/nan 分解。"""
+        try:
+            outdir = os.environ.get("UDTCA_DIAG_DIR", "")
+            p = dict(module.named_parameters()).get(bad_name, None)
+            if p is None or p.grad is None:
+                print(f"[diag][bad_grad] rank={dist.get_rank()} name={bad_name} "
+                      f"grad 取不到", flush=True)
+                return
+            g = p.grad
+            if hasattr(g, "to_local"):
+                g = g.to_local()
+            gf = g.detach().float()
+            wf = p.detach().float()
+            n_nan = int(torch.isnan(gf).sum().item())
+            n_pinf = int(torch.isposinf(gf).sum().item())
+            n_ninf = int(torch.isneginf(gf).sum().item())
+            bad_idx = (~torch.isfinite(gf)).nonzero()
+            first = bad_idx[0].tolist() if bad_idx.numel() else None
+            last = bad_idx[-1].tolist() if bad_idx.numel() else None
+            line = (
+                f"[diag][bad_grad] rank={dist.get_rank()} stage={self.stage_idx} "
+                f"name={bad_name} numel={gf.numel()} nan={n_nan} +inf={n_pinf} "
+                f"-inf={n_ninf} first_bad={first} last_bad={last} "
+                f"grad_absmax={gf.nan_to_num().abs().max().item():.6g} "
+                f"w_nan={int(torch.isnan(wf).sum())} "
+                f"w_absmax={wf.nan_to_num().abs().max().item():.6g} "
+                f"| action=skip_optimizer AND skip step-boundary barrier"
+            )
+            print(line, flush=True)
+            if outdir:
+                os.makedirs(outdir, exist_ok=True)
+                with open(os.path.join(outdir, "bad_grad.txt"), "a") as fh:
+                    fh.write(line + "\n")
+                torch.save(
+                    {"name": bad_name, "grad": gf.cpu(), "weight": wf.cpu(),
+                     "rank": dist.get_rank(), "stage": self.stage_idx},
+                    os.path.join(outdir, f"bad_grad_{tag}.pt"),
+                )
+        except Exception as exc:  # 诊断失败不能影响训练
+            print(f"[diag] bad_grad dump failed: {exc!r}", flush=True)
 
     def _has_nonfinite_grads(self, module: torch.nn.Module) -> bool:
         return self._find_nonfinite_grad(module) is not None
@@ -1676,8 +1792,22 @@ class PolarParallel:
                     )
 
                 bad_grad = self._find_nonfinite_grad(self.stage.submod)
+                if os.environ.get("UDTCA_DIAG_RANKTRACE", "1") != "0":
+                    print(
+                        f"[diag][gradcheck] rank={dist.get_rank()} "
+                        f"stage={self.stage_idx} step={global_step} "
+                        f"batch={batch_idx} bad="
+                        f"{None if bad_grad is None else bad_grad[0]}",
+                        flush=True,
+                    )
+                if global_step == 0 and batch_idx == 0 and self.stage_idx == 0:
+                    self._diag_param_digest(self.stage.submod)
                 if bad_grad is not None:
                     bad_name, bad_count, bad_max_abs = bad_grad
+                    self._diag_dump_bad_grad(
+                        self.stage.submod, bad_name,
+                        f"rank{dist.get_rank()}_step{global_step}_batch{batch_idx}",
+                    )
                     if self.optimizer:
                         self.optimizer.zero_grad(set_to_none=True)
                     self._clear_polar_residual_state_()
@@ -1701,6 +1831,21 @@ class PolarParallel:
                     )
 
                 self.optimizer.step()
+                # 每轮参数更新完在进下一次 forward 之前做一次全局同步：
+                # 所有 rank 都完成本 iter 的 update 之后才允许开始下一 iter。
+                print(
+                    f"[diag][barrier] rank={dist.get_rank()} "
+                    f"stage={self.stage_idx} step={global_step} "
+                    f"batch={batch_idx} enter",
+                    flush=True,
+                )
+                dist.barrier()
+                print(
+                    f"[diag][barrier] rank={dist.get_rank()} "
+                    f"stage={self.stage_idx} step={global_step} "
+                    f"batch={batch_idx} exit",
+                    flush=True,
+                )
                 _comm_watchdog_beat(f"step={global_step} optimizer_step")
                 debug_steps = int(getattr(self.args, "debug_nan_steps", 0) or 0)
                 if global_step == 0 or batch_idx < debug_steps:

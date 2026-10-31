@@ -13,6 +13,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+def _wall_clock() -> str:
+    """墙上时钟（本地时区，毫秒），用来和 dmesg / NCCL 日志对齐。"""
+    now = time.time()
+    return time.strftime("%m-%d %H:%M:%S", time.localtime(now)) + f".{int((now % 1) * 1000):03d}"
+
+
 # profiler 标注名：DP 同步区间 / PP 流水线区间。
 # 运行时每步打印的重叠率和 offline 的 utils/overlap_interval.py 都认这两个标注，
 # 保证两边算的是同一对区间。见 wrapper.PP_ANN（PP 那侧）。
@@ -36,9 +42,41 @@ def _polar_hook_debug(message: str) -> None:
     except Exception:
         rank = -1
     print(
-        f"[polar-hook-debug rank={rank} t={time.time():.6f}] {message}",
+        f"[polar-hook-debug {_wall_clock()} rank={rank} t={time.time():.6f}] {message}",
         flush=True,
     )
+
+
+# ---------------------------------------------------------------- 临时诊断输出
+# 目的：卡死时能看出"哪个 rank、走到哪一行、第几次进这个函数"。
+# 定位完就删。全部 flush=True：train.log 是重定向的，缓冲区里的东西卡死时会丢。
+_DBG_T0 = time.monotonic()
+_dbg_rank = [-2]
+_dbg_seq = {}
+
+
+def _dbg_rank_() -> int:
+    if _dbg_rank[0] == -2:
+        try:
+            _dbg_rank[0] = dist.get_rank() if dist.is_initialized() else -1
+        except Exception:
+            _dbg_rank[0] = -1
+    return _dbg_rank[0]
+
+
+def _dbg(msg: str, site: str = "") -> None:
+    print(
+        f"[dbg {_wall_clock()} {time.monotonic() - _DBG_T0:9.3f}s rank={_dbg_rank_()} "
+        f"lrank={os.environ.get('LOCAL_RANK', '?')} pid={os.getpid()}"
+        f"{' ' + site if site else ''}] {msg}",
+        flush=True,
+    )
+
+
+def _dbg_no(key: str) -> int:
+    """同一个 key 每调用一次 +1，用来数"第几遍进入这段代码"。"""
+    _dbg_seq[key] = _dbg_seq.get(key, 0) + 1
+    return _dbg_seq[key]
 
 
 def _polar_hook_timing_enabled() -> bool:
@@ -106,6 +144,12 @@ def _all_reduce_flat_async(
     group,
     lowbit_group=None,
 ):
+    _dbg(
+        f"ENTER _all_reduce_flat_async#{_dbg_no('flat_async')} "
+        f"branch={'lowbit' if lowbit_group is not None else 'dense'} "
+        f"numel={int(tensor.numel())} dtype={tensor.dtype} device={tensor.device}",
+        site="hooks:_all_reduce_flat_async",
+    )
     if lowbit_group is not None:
         _trace_evidence(
             "POLAR",
@@ -131,11 +175,14 @@ def _all_reduce_flat_async(
             f"numel={int(tensor.numel())} dtype={tensor.dtype} "
             f"bitwidth={getattr(lowbit_group, 'bitwidth', 'unknown')}"
         )
+        _dbg("ENTER lowbit_group.all_reduce (hooks:_all_reduce_flat_async)", site="hooks:167")
         work = lowbit_group.all_reduce(
             tensor,
             op=dist.ReduceOp.SUM,
             async_op=True,
         )
+        _dbg("EXIT lowbit_group.all_reduce returned work "
+             f"type={type(work).__name__}", site="hooks:167")
         _polar_hook_debug("lowbit all_reduce returned")
         return work
     _trace_evidence(
@@ -149,7 +196,10 @@ def _all_reduce_flat_async(
         "dense all_reduce async start "
         f"numel={int(tensor.numel())} dtype={tensor.dtype}"
     )
+    _dbg("ENTER dist.all_reduce (hooks:_all_reduce_flat_async dense)", site="hooks:186")
     work = dist.all_reduce(tensor, group=group, async_op=True)
+    _dbg("EXIT dist.all_reduce returned work "
+         f"type={type(work).__name__}", site="hooks:186")
     _polar_hook_debug("dense all_reduce async returned")
     return work
 
@@ -226,13 +276,31 @@ def _wait_work_with_timeout(work, tag: str) -> None:
     deadline = time.monotonic() + timeout_s if timeout_s > 0 else None
     next_peer_check = time.monotonic() + 1.0
     timed_out = False
+    call_no = _dbg_no(f"wait:{tag}")
+    t_enter = time.monotonic()
+    polls = 0
+    _dbg(f"ENTER _wait_work_with_timeout call#{call_no} tag={tag} "
+         f"timeout={timeout_s:.1f}s work={type(work).__name__}",
+         site="hooks:_wait_work_with_timeout")
     while True:
+        polls += 1
+        # 前 3 次每圈都打，之后每 50 圈（约 10s）打一次，避免刷爆日志
+        if polls <= 3 or polls % 50 == 0:
+            _dbg(f"poll call#{call_no} iter={polls} tag={tag} "
+                 f"waited={time.monotonic() - t_enter:.1f}s",
+                 site="hooks:_wait_work_with_timeout")
         done = _work_is_completed(work)
         if done is None:
             # Work type without completion polling (e.g. thread-backed launch).
+            _dbg(f"poll call#{call_no} no-is_completed -> blocking work.wait() "
+                 f"tag={tag}", site="hooks:_wait_work_with_timeout")
             work.wait()
             return
         if done:
+            _dbg(f"EXIT _wait_work_with_timeout call#{call_no} tag={tag} "
+                 f"completed after polls={polls} "
+                 f"waited={time.monotonic() - t_enter:.3f}s",
+                 site="hooks:_wait_work_with_timeout")
             break
         now = time.monotonic()
         if now >= next_peer_check:
@@ -250,15 +318,23 @@ def _wait_work_with_timeout(work, tag: str) -> None:
                 f"op={tag} timeout={timeout_s:.1f}s",
                 flush=True,
             )
+            _dbg(f"TIMEOUT call#{call_no} tag={tag} polls={polls} "
+                 f"-> rollback_and_exit", site="hooks:_wait_work_with_timeout")
             _rollback_and_exit(f"{tag} timeout after {timeout_s:.1f}s")
             # Rollback could not be coordinated: never exit underneath peers.
             work.wait()
             return
-        time.sleep(0.02)
+        time.sleep(float(os.environ.get("UDTCA_DBG_POLL_S", "0.2")))
+    _dbg(f"EXIT _wait_work_with_timeout call#{call_no} tag={tag} work.wait()",
+         site="hooks:_wait_work_with_timeout")
     work.wait()
 
 
 def _wait_and_average_flat(work, tensor: torch.Tensor, group) -> None:
+    _dbg(f"ENTER _wait_and_average_flat#{_dbg_no('wait_avg')} "
+         f"has_work={work is not None} already_averaged="
+         f"{getattr(work, '_polar_already_averaged', False)}",
+         site="hooks:_wait_and_average_flat")
     if work is not None:
         _wait_work_with_timeout(work, "flat_dp_allreduce")
     if getattr(work, "_polar_already_averaged", False):
@@ -1993,6 +2069,9 @@ class PolarGpipeLowMemoryErrorFeedbackHook:
             and hasattr(self.lowbit_group, "all_reduce_stream")
             and not getattr(self.lowbit_group, "backend_allreduce", False)
         ):
+            _dbg(f"ENTER lowbit_group.all_reduce_stream "
+                 f"numel={int(buffer.numel())} stream=comm_stream",
+                 site="hooks:_all_reduce_bucket_async_")
             work = self.lowbit_group.all_reduce_stream(
                 buffer,
                 stream=self.comm_stream,
@@ -2001,7 +2080,10 @@ class PolarGpipeLowMemoryErrorFeedbackHook:
                 post_scale=1.0 / max(int(self.dp_mesh.size()), 1),
             )
             setattr(work, "_polar_already_averaged", True)
+            _dbg(f"EXIT lowbit_group.all_reduce_stream work={type(work).__name__}",
+                 site="hooks:_all_reduce_bucket_async_")
             return work
+        _dbg("branch=flat_async (all_reduce_stream 不适用)", site="hooks:_all_reduce_bucket_async_")
         return _all_reduce_flat_async(
             buffer,
             group=self.dp_group,
@@ -2106,7 +2188,13 @@ class PolarGpipeLowMemoryErrorFeedbackHook:
 
     @torch.no_grad()
     def _finish_bucket_(self, inflight: _InflightBucket) -> None:
+        _dbg(f"_finish_bucket_#{_dbg_no('finish_bucket')} enter "
+             f"entries={len(inflight.entries)} "
+             f"numel={int(inflight.buffer.numel())}",
+             site="hooks:_finish_bucket_")
         _wait_and_average_flat(inflight.work, inflight.buffer, self.dp_group)
+        _dbg(f"_finish_bucket_#{_dbg_seq.get('finish_bucket', 0)} returned "
+             f"from wait, copying grads back", site="hooks:_finish_bucket_")
 
         offset = 0
         for entry in inflight.entries:
@@ -2120,24 +2208,46 @@ class PolarGpipeLowMemoryErrorFeedbackHook:
 
     @torch.no_grad()
     def _bucketed_all_reduce_(self) -> None:
+        n = _dbg_no("bucketed_all_reduce")
         self._log_bucket_schema_once()
         self._mark_dp_window_start()
         inflight: List[_InflightBucket] = []
+        _dbg(f"_bucketed_all_reduce_#{n} ENTER buckets={len(self.buckets)} "
+             f"max_inflight={self.max_inflight_buckets}",
+             site="hooks:_bucketed_all_reduce_")
 
-        for entries in self.buckets:
+        for i, entries in enumerate(self.buckets):
             buffer = self._pack_bucket_and_update_error_(entries)
+            _dbg(f"_bucketed_all_reduce_#{n} bucket {i}/{len(self.buckets)} "
+                 f"packed numel={int(buffer.numel())} -> issuing all_reduce",
+                 site="hooks:_bucketed_all_reduce_")
             work = self._all_reduce_bucket_async_(buffer)
+            _dbg(f"_bucketed_all_reduce_#{n} bucket {i} all_reduce issued "
+                 f"work={type(work).__name__}",
+                 site="hooks:_bucketed_all_reduce_")
             inflight.append(_InflightBucket(work=work, buffer=buffer, entries=entries))
 
             if len(inflight) >= self.max_inflight_buckets:
+                _dbg(f"_bucketed_all_reduce_#{n} inflight full "
+                     f"({len(inflight)}), draining oldest",
+                     site="hooks:_bucketed_all_reduce_")
                 self._finish_bucket_(inflight.pop(0))
 
         while inflight:
             self._finish_bucket_(inflight.pop(0))
+        _dbg(f"_bucketed_all_reduce_#{n} EXIT all buckets finished",
+             site="hooks:_bucketed_all_reduce_")
 
     @torch.no_grad()
     def _finish_pred_bucket_to_cpu_(self, inflight: _InflightBucket) -> None:
+        _dbg(f"_finish_pred_bucket_to_cpu_#{_dbg_no('finish_pred')} enter "
+             f"entries={len(inflight.entries)} "
+             f"numel={int(inflight.buffer.numel())}",
+             site="hooks:_finish_pred_bucket_to_cpu_")
         _wait_and_average_flat(inflight.work, inflight.buffer, self.dp_group)
+        _dbg(f"_finish_pred_bucket_to_cpu_#{_dbg_seq.get('finish_pred', 0)} "
+             f"wait returned -> offloading to CPU",
+             site="hooks:_finish_pred_bucket_to_cpu_")
         assert self.offloaded_pred_buckets is not None
         self.offloaded_pred_buckets.append(
             _OffloadedBucket(
@@ -2409,6 +2519,10 @@ class PolarGpipeLowMemoryErrorFeedbackHook:
     def _finish_offloaded_prediction_(self) -> None:
         if self.offloaded_pred_buckets is None:
             return
+        _dbg(f"_finish_offloaded_prediction_#{_dbg_no('finish_pred_all')} ENTER "
+             f"next_bucket={self.next_pred_bucket_idx}/{len(self.buckets)} "
+             f"offloaded={len(self.offloaded_pred_buckets)}",
+             site="hooks:_finish_offloaded_prediction_")
 
         while (
             self.next_pred_bucket_idx is not None
@@ -2473,6 +2587,12 @@ class PolarGpipeLowMemoryErrorFeedbackHook:
         call_t0 = time.perf_counter()
         trigger = self._trigger_condition()
         active_prediction = self.offloaded_pred_buckets is not None
+        hook_no = _dbg_no("lowmem_hook_call")
+        if hook_no <= 3 or hook_no % 100 == 0 or trigger:
+            _dbg(f"lowmem hook __call__#{hook_no} ENTER "
+                 f"mb={self.micro_batch_counter}/{self.micro_batch_size} "
+                 f"trigger={trigger} pred={active_prediction}",
+                 site="hooks:lowmem:__call__")
         _polar_hook_timing(
             "ef_lowmem hook enter "
             f"micro_batch_counter={self.micro_batch_counter} "
@@ -2516,12 +2636,17 @@ class PolarGpipeLowMemoryErrorFeedbackHook:
 
             if self.micro_batch_counter == self.micro_batch_size:
                 t_finish = time.perf_counter()
+                _dbg(f"lowmem hook __call__#{hook_no} 进入最终 DP 同步 "
+                     f"path={'bucketed_all_reduce' if self.offloaded_pred_buckets is None else 'finish_offloaded_prediction'}",
+                     site="hooks:lowmem:__call__")
                 if self.offloaded_pred_buckets is None:
                     _polar_hook_timing("ef_lowmem hook final dense/bucket allreduce enter")
                     self._bucketed_all_reduce_()
                 else:
                     _polar_hook_timing("ef_lowmem hook finish offloaded prediction enter")
                     self._finish_offloaded_prediction_()
+                _dbg(f"lowmem hook __call__#{hook_no} 最终 DP 同步完成",
+                     site="hooks:lowmem:__call__")
                 _polar_hook_timing(
                     "ef_lowmem hook final path returned "
                     f"elapsed_ms={(time.perf_counter() - t_finish) * 1000.0:.3f}"
