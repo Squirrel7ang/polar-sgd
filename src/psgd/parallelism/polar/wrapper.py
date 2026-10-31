@@ -1200,27 +1200,151 @@ class PolarParallel:
         except Exception as exc:
             print(f"[diag][syncprobe] failed: {exc!r}", flush=True)
 
-    def _find_nonfinite_grad(self, module: torch.nn.Module):
-        # [syncprobe] 诊断优先于跳过：即使检查已关，也每步记一次标量读回是否可靠
-        if os.environ.get("UDTCA_DIAG_SYNCCHECK", "0") == "1":
-            self._diag_sync_probe(module)
-        # [disable_gradcheck] 该检查在 Corex 上对 vLLM 大小的 embed grad 会误报
-        # （同一 tensor 连读两次判定了不同结果），且误报走 continue 会跳过
-        # step-boundary barrier 把整个 32 卡作业锁死。默认关闭。
-        if os.environ.get("UDTCA_SKIP_GRADCHECK", "1") == "1":
-            return None
+    # ---------------------------------------------------------------- grad guard
+    # 为什么不再用 `isfinite(g).all().item()`：
+    #   在 Corex 上实测过同一块 grad 连着读两次会给出不同结论（记录见
+    #   wrapper.py.bak-diag）。错不在判据，而在"异步写还没落地时就读回标量"。
+    #   所以这里改成三件事：
+    #     1) 判定和累加全部在设备侧做（逐 chunk 的 isfinite → int64 计数），
+    #        扫描循环里不出现任何 .item()；
+    #     2) 全部参数扫完之后，在 step 边界做一次 torch.cuda.synchronize()，
+    #        再把长度=参数个数 的计数向量一次性读回；
+    #     3) 命中之后**不跳过** optimizer.step、**不跳过** step 边界 barrier，
+    #        只把出问题的参数就地 nan_to_num_ 成 0。旧实现用 continue 跳过，
+    #        各 rank 控制流一分叉就把整个作业锁死（2026-10-31 那次事故）。
+    #   开关：UDTCA_GRADGUARD=sanitize(默认)|report|off；仍兼容 UDTCA_SKIP_GRADCHECK=1。
+    _GRAD_SCAN_CHUNK = 8 * 1024 * 1024
+
+    @torch.no_grad()
+    def _scan_nonfinite_grads(self, module: torch.nn.Module):
+        """设备侧扫全部 grad 的有限性，只做一次标量读回。
+
+        返回 [(name, nonfinite_count, absmax), ...]；空列表表示全部有限。
+        """
+        names, counters, flats = [], [], []
+        device = None
         for name, p in module.named_parameters():
-            if p.grad is None:
-                continue
             grad = p.grad
+            if grad is None:
+                continue
             if hasattr(grad, "to_local"):
                 grad = grad.to_local()
-            finite = torch.isfinite(grad)
-            if not bool(finite.all().item()):
-                bad_count = int((~finite).sum().item())
-                max_abs = float(grad.detach().nan_to_num().abs().max().item())
-                return name, bad_count, max_abs
-        return None
+            if not torch.is_floating_point(grad):
+                continue
+            flat = grad.detach().reshape(-1)      # 连续时是 view，不额外占内存
+            device = flat.device
+            counter = torch.zeros((), device=device, dtype=torch.int64)
+            for off in range(0, flat.numel(), self._GRAD_SCAN_CHUNK):
+                seg = flat[off: off + self._GRAD_SCAN_CHUNK]
+                finite = torch.isfinite(seg)
+                counter += seg.numel() - finite.sum(dtype=torch.int64)
+            names.append(name)
+            counters.append(counter)
+            flats.append(flat)
+
+        if not counters:
+            return []
+        if device is not None and device.type == "cuda":
+            # 一次全设备同步：把 compute/comm/copy 三条流的活都排空，之后读数才可信
+            torch.cuda.synchronize(device)
+        counts = torch.stack(counters).cpu().tolist()   # 唯一的标量读回
+        bad = []
+        for name, n_bad, flat in zip(names, counts, flats):
+            if not n_bad:
+                continue
+            # 只有真出问题的参数才去算 absmax，而且分块算，避免整块临时拷贝
+            absmax = torch.zeros((), device=flat.device, dtype=torch.float32)
+            for off in range(0, flat.numel(), self._GRAD_SCAN_CHUNK):
+                seg = flat[off: off + self._GRAD_SCAN_CHUNK]
+                absmax = torch.maximum(absmax, seg.abs().nan_to_num().amax())
+            bad.append((name, int(n_bad), float(absmax)))
+        return bad
+
+    @torch.no_grad()
+    def _sanitize_nonfinite_grads(self, module: torch.nn.Module, bad_names) -> None:
+        """就地清理坏 grad：只把非有限元素置 0，保留同一 tensor 里的正常元素。"""
+        wanted = set(bad_names)
+        for name, p in module.named_parameters():
+            if name not in wanted or p.grad is None:
+                continue
+            grad = p.grad
+            local = grad.to_local() if hasattr(grad, "to_local") else grad
+            if not local.is_contiguous():
+                torch.nan_to_num_(local, nan=0.0, posinf=0.0, neginf=0.0)
+                continue
+            view = local.view(-1)                 # 连续，保证是 view，写回原存储
+            for off in range(0, view.numel(), self._GRAD_SCAN_CHUNK):
+                seg = view[off: off + self._GRAD_SCAN_CHUNK]
+                torch.nan_to_num_(seg, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _grad_guard(self, module: torch.nn.Module, tag: str):
+        """step 边界的一次性 grad 体检：扫描 → 记录 →（默认）就地清理。
+
+        返回出问题的 [(name, count, absmax), ...]。任何异常都只打印、不抛出，
+        且**不改变控制流**——所有 rank 后续的 clip / optimizer.step / barrier 一律照常。
+        """
+        mode = os.environ.get("UDTCA_GRADGUARD", "sanitize").lower()
+        if mode in {"0", "off", "false", "no", "none"}:
+            return []
+        if os.environ.get("UDTCA_SKIP_GRADCHECK", "0") == "1":
+            return []
+        rank = dist.get_rank() if dist.is_initialized() else -1
+        if os.environ.get("UDTCA_DIAG_SYNCCHECK", "0") == "1":
+            try:
+                self._diag_sync_probe(module)
+            except Exception:
+                pass
+        try:
+            bad = self._scan_nonfinite_grads(module)
+        except Exception as exc:              # 体检本身绝不能弄崩训练
+            print(
+                f"[gradguard] rank={rank} stage={self.stage_idx} tag={tag} "
+                f"scan_failed={exc!r}",
+                flush=True,
+            )
+            return []
+        if not bad:
+            if os.environ.get("UDTCA_GRADGUARD_LOG_OK", "0") == "1":
+                print(
+                    f"[gradguard] rank={rank} stage={self.stage_idx} "
+                    f"tag={tag} all_finite",
+                    flush=True,
+                )
+            return bad
+        for name, n_bad, absmax in bad:
+            print(
+                f"[gradguard] rank={rank} stage={self.stage_idx} tag={tag} "
+                f"param={name} nonfinite={n_bad} absmax={absmax:.6g}",
+                flush=True,
+            )
+        self._diag_dump_bad_grad(module, bad[0][0], f"rank{rank}_{tag}")
+        if mode.startswith("sanit"):
+            try:
+                self._sanitize_nonfinite_grads(module, [n for n, _, _ in bad])
+            except Exception as exc:          # 清理失败也不能抛，宁可带病继续
+                print(
+                    f"[gradguard] rank={rank} stage={self.stage_idx} tag={tag} "
+                    f"sanitize_failed={exc!r}",
+                    flush=True,
+                )
+            print(
+                f"[gradguard] rank={rank} stage={self.stage_idx} tag={tag} "
+                f"action=sanitize params={len(bad)} "
+                f"(optimizer.step / barrier 照常执行)",
+                flush=True,
+            )
+        else:
+            print(
+                f"[gradguard] rank={rank} stage={self.stage_idx} tag={tag} "
+                f"action=report-only",
+                flush=True,
+            )
+        return bad
+
+    def _find_nonfinite_grad(self, module: torch.nn.Module):
+        """兼容旧接口：返回第一个坏参数 (name, count, absmax)，全部有限时 None。"""
+        bad = self._scan_nonfinite_grads(module)
+        return bad[0] if bad else None
 
     def _diag_param_digest(self, module: torch.nn.Module) -> None:
         """step0/batch0：打印本 rank 每个参数 grad 的数字指纹，供跨 rank 对比。"""
@@ -1245,7 +1369,10 @@ class PolarParallel:
             )
 
     def _diag_dump_bad_grad(self, module: torch.nn.Module, bad_name: str, tag: str) -> None:
-        """把出问题的那个参数的 grad / weight 落盘并打印 inf/nan 分解。"""
+        """坏参数取证：分块统计 nan/±inf/absmax，整块不再做 float 拷贝。
+
+        只做一次标量读回；只有 UDTCA_DIAG_DIR 设了才把数据存盘。
+        """
         try:
             outdir = os.environ.get("UDTCA_DIAG_DIR", "")
             p = dict(module.named_parameters()).get(bad_name, None)
@@ -1256,22 +1383,42 @@ class PolarParallel:
             g = p.grad
             if hasattr(g, "to_local"):
                 g = g.to_local()
-            gf = g.detach().float()
-            wf = p.detach().float()
-            n_nan = int(torch.isnan(gf).sum().item())
-            n_pinf = int(torch.isposinf(gf).sum().item())
-            n_ninf = int(torch.isneginf(gf).sum().item())
-            bad_idx = (~torch.isfinite(gf)).nonzero()
-            first = bad_idx[0].tolist() if bad_idx.numel() else None
-            last = bad_idx[-1].tolist() if bad_idx.numel() else None
+            gflat = g.detach().reshape(-1)
+            w = p.detach()
+            if hasattr(w, "to_local"):
+                w = w.to_local()
+            wflat = w.reshape(-1)
+            dev = gflat.device
+            chunk = self._GRAD_SCAN_CHUNK
+
+            def _tally(flat, want_counts):
+                n_nan = torch.zeros((), device=dev, dtype=torch.int64)
+                n_pinf = torch.zeros((), device=dev, dtype=torch.int64)
+                n_ninf = torch.zeros((), device=dev, dtype=torch.int64)
+                amax = torch.zeros((), device=dev, dtype=torch.float32)
+                for off in range(0, flat.numel(), chunk):
+                    seg = flat[off: off + chunk]
+                    if want_counts:
+                        n_nan += torch.isnan(seg).sum(dtype=torch.int64)
+                        n_pinf += torch.isposinf(seg).sum(dtype=torch.int64)
+                        n_ninf += torch.isneginf(seg).sum(dtype=torch.int64)
+                    amax = torch.maximum(amax, seg.abs().nan_to_num().amax())
+                return n_nan, n_pinf, n_ninf, amax
+
+            with torch.no_grad():
+                g_nan, g_pinf, g_ninf, g_amax = _tally(gflat, True)
+                w_nan, _, _, w_amax = _tally(wflat, True)
+                if dev.type == "cuda":
+                    torch.cuda.synchronize(dev)
+                vals = [t.item() for t in (g_nan, g_pinf, g_ninf, g_amax, w_nan, w_amax)]
+
             line = (
                 f"[diag][bad_grad] rank={dist.get_rank()} stage={self.stage_idx} "
-                f"name={bad_name} numel={gf.numel()} nan={n_nan} +inf={n_pinf} "
-                f"-inf={n_ninf} first_bad={first} last_bad={last} "
-                f"grad_absmax={gf.nan_to_num().abs().max().item():.6g} "
-                f"w_nan={int(torch.isnan(wf).sum())} "
-                f"w_absmax={wf.nan_to_num().abs().max().item():.6g} "
-                f"| action=skip_optimizer AND skip step-boundary barrier"
+                f"name={bad_name} numel={gflat.numel()} nan={int(vals[0])} "
+                f"+inf={int(vals[1])} -inf={int(vals[2])} "
+                f"grad_absmax={vals[3]:.6g} w_nan={int(vals[4])} "
+                f"w_absmax={vals[5]:.6g} | action=见 [gradguard] 行（默认 sanitize，"
+                f"不跳过 optimizer.step / barrier）"
             )
             print(line, flush=True)
             if outdir:
@@ -1279,7 +1426,8 @@ class PolarParallel:
                 with open(os.path.join(outdir, "bad_grad.txt"), "a") as fh:
                     fh.write(line + "\n")
                 torch.save(
-                    {"name": bad_name, "grad": gf.cpu(), "weight": wf.cpu(),
+                    {"name": bad_name, "grad": gflat.reshape(g.shape).cpu(),
+                     "weight": wflat.reshape(w.shape).cpu(),
                      "rank": dist.get_rank(), "stage": self.stage_idx},
                     os.path.join(outdir, f"bad_grad_{tag}.pt"),
                 )
@@ -1791,38 +1939,14 @@ class PolarParallel:
                         getattr(self, "lowbit_group", None)
                     )
 
-                bad_grad = self._find_nonfinite_grad(self.stage.submod)
-                if os.environ.get("UDTCA_DIAG_RANKTRACE", "1") != "0":
-                    print(
-                        f"[diag][gradcheck] rank={dist.get_rank()} "
-                        f"stage={self.stage_idx} step={global_step} "
-                        f"batch={batch_idx} bad="
-                        f"{None if bad_grad is None else bad_grad[0]}",
-                        flush=True,
-                    )
+                # 梯度体检：扫描 + 记录 +（默认）就地清理。不改变控制流，
+                # 命中也照常做 clip / optimizer.step / step 边界 barrier。
+                self._grad_guard(
+                    self.stage.submod,
+                    f"step{global_step}_batch{batch_idx}",
+                )
                 if global_step == 0 and batch_idx == 0 and self.stage_idx == 0:
                     self._diag_param_digest(self.stage.submod)
-                if bad_grad is not None:
-                    bad_name, bad_count, bad_max_abs = bad_grad
-                    self._diag_dump_bad_grad(
-                        self.stage.submod, bad_name,
-                        f"rank{dist.get_rank()}_step{global_step}_batch{batch_idx}",
-                    )
-                    if self.optimizer:
-                        self.optimizer.zero_grad(set_to_none=True)
-                    self._clear_polar_residual_state_()
-                    if self.stage.is_last:
-                        print(
-                            f"[warn] non-finite gradients at step {global_step} "
-                            f"rank={dist.get_rank()} stage={self.stage_idx}; "
-                            f"skip optimizer step; cleared POLAR residual state; "
-                            f"first_bad={bad_name} bad_count={bad_count} "
-                            f"max_abs={bad_max_abs:.6g}",
-                            flush=True,
-                        )
-                    global_step += 1
-                    prof.step()
-                    continue
 
                 if grad_clip_norm > 0:
                     self._clip_grad_norm_local_(
@@ -2110,23 +2234,10 @@ class PolarParallel:
                 if self.baseline_mode == "manual":
                     self._allreduce_dp_grads_()
 
-                bad_grad = self._find_nonfinite_grad(stage_mod)
-                if bad_grad is not None:
-                    bad_name, bad_count, bad_max_abs = bad_grad
-                    optimizer.zero_grad(set_to_none=True)
-                    self._clear_polar_residual_state_()
-                    if baseline_stage.is_last:
-                        print(
-                            f"[warn] non-finite gradients at step {global_step} "
-                            f"rank={dist.get_rank()} stage={self.stage_idx}; "
-                            f"skip optimizer step; cleared POLAR residual state; "
-                            f"first_bad={bad_name} bad_count={bad_count} "
-                            f"max_abs={bad_max_abs:.6g}",
-                            flush=True,
-                        )
-                    global_step += 1
-                    prof.step()
-                    continue
+                # 梯度体检：扫描 + 记录 +（默认）就地清理，控制流不变。
+                self._grad_guard(
+                    stage_mod, f"step{global_step}_batch{batch_idx}"
+                )
 
                 if grad_clip_norm > 0:
                     self._clip_grad_norm_local_(
