@@ -223,58 +223,16 @@ def _work_is_completed(work) -> Optional[bool]:
         return None
 
 
-def _nccl_revoke():
-    """Import the shared revoke/shutdown helpers (experiments/qwen14b)."""
-    import sys as _sys
-
-    _revoke_dir = os.environ.get(
-        "UDTCA_REVOKE_PY_DIR", "/data/tangruijing/udtca/experiments/qwen14b"
-    )
-    if _revoke_dir not in _sys.path:
-        _sys.path.insert(0, _revoke_dir)
-    import nccl_revoke
-
-    return nccl_revoke
-
-
-def _revoke_requested() -> bool:
-    """True once any rank of this node has started rolling the job back."""
-    try:
-        return _nccl_revoke().revoke_requested()
-    except Exception:
-        return False
-
-
-def _rollback_and_exit(reason: str) -> None:
-    """Revoke locally and exit once the node is quiescent (never a signal).
-
-    Returns only if the rollback cannot be coordinated; callers then keep the
-    process alive instead of exiting underneath their peers.
-    """
-    try:
-        _nccl_revoke().coordinated_shutdown(
-            reason,
-            exit_code=3,
-            device_index=int(os.environ.get("LOCAL_RANK", "0")),
-            quiesce_timeout_s=float(os.environ.get("UDTCA_REVOKE_QUIESCE_S", "10")),
-        )
-    except Exception as exc:
-        print(f"[comm-watchdog] rollback unavailable: {exc!r}", flush=True)
-
-
 def _wait_work_with_timeout(work, tag: str) -> None:
-    """Wait for a bitscom/NCCL Work; a hang rolls the job back and exits.
+    """Wait for a bitscom/NCCL Work, logging (never aborting) on a long wait.
 
-    The timeout is internal: each rank revokes its own comms and then waits
-    until every local rank is quiescent before exiting, so no peer is ever
-    interrupted mid-collective (that is what causes XID 24). A peer that
-    starts the rollback for any reason also drags this rank into it.
+    A timeout only produces an INTERNAL_TIMEOUT line and the wait continues;
+    the process is never terminated from here.
     """
     if work is None:
         return
     timeout_s = _comm_call_timeout_s()
     deadline = time.monotonic() + timeout_s if timeout_s > 0 else None
-    next_peer_check = time.monotonic() + 1.0
     timed_out = False
     call_no = _dbg_no(f"wait:{tag}")
     t_enter = time.monotonic()
@@ -303,10 +261,6 @@ def _wait_work_with_timeout(work, tag: str) -> None:
                  site="hooks:_wait_work_with_timeout")
             break
         now = time.monotonic()
-        if now >= next_peer_check:
-            next_peer_check = now + 1.0
-            if _revoke_requested():
-                _rollback_and_exit(f"peer rank requested revoke while waiting for {tag}")
         if deadline is not None and now > deadline and not timed_out:
             timed_out = True
             try:
@@ -314,16 +268,12 @@ def _wait_work_with_timeout(work, tag: str) -> None:
             except Exception:
                 rank = -1
             print(
-                f"[comm-watchdog] INTERNAL_TIMEOUT rank={rank} pid={os.getpid()} "
-                f"op={tag} timeout={timeout_s:.1f}s",
+                f"[comm] INTERNAL_TIMEOUT rank={rank} pid={os.getpid()} "
+                f"op={tag} timeout={timeout_s:.1f}s (still waiting)",
                 flush=True,
             )
             _dbg(f"TIMEOUT call#{call_no} tag={tag} polls={polls} "
-                 f"-> rollback_and_exit", site="hooks:_wait_work_with_timeout")
-            _rollback_and_exit(f"{tag} timeout after {timeout_s:.1f}s")
-            # Rollback could not be coordinated: never exit underneath peers.
-            work.wait()
-            return
+                 f"-> keep waiting", site="hooks:_wait_work_with_timeout")
         time.sleep(float(os.environ.get("UDTCA_DBG_POLL_S", "0.2")))
     _dbg(f"EXIT _wait_work_with_timeout call#{call_no} tag={tag} work.wait()",
          site="hooks:_wait_work_with_timeout")
@@ -1945,6 +1895,55 @@ class PolarGpipeLowMemoryErrorFeedbackHook:
             torch.cuda.synchronize(flat.device)
         return int(cnt)
 
+    _TRACE_CHUNK = 8 * 1024 * 1024
+
+    @torch.no_grad()
+    def _tally_(self, flat: torch.Tensor):
+        """分块扫一遍，返回 (非有限数, nan 数, inf 数, absmax)；只做一次读回。"""
+        nan = torch.zeros((), device=flat.device, dtype=torch.int64)
+        inf = torch.zeros((), device=flat.device, dtype=torch.int64)
+        amax = torch.zeros((), device=flat.device, dtype=torch.float32)
+        for off in range(0, flat.numel(), self._TRACE_CHUNK):
+            seg = flat[off: off + self._TRACE_CHUNK]
+            nan += torch.isnan(seg).sum(dtype=torch.int64)
+            inf += torch.isinf(seg).sum(dtype=torch.int64)
+            amax = torch.maximum(amax, seg.abs().nan_to_num().amax())
+        vals = torch.stack([nan.float(), inf.float(), amax]).cpu().tolist()
+        n_nan, n_inf, mx = int(vals[0]), int(vals[1]), float(vals[2])
+        return n_nan + n_inf, n_nan, n_inf, mx
+
+    def _param_name_(self, idx: int) -> str:
+        if self._probe_names is None:
+            try:
+                self._probe_names = [n for n, _ in self.model.named_parameters()]
+            except Exception:
+                self._probe_names = []
+        return self._probe_names[idx] if idx < len(self._probe_names) else f"#{idx}"
+
+    def _trace_flat_(self, flat, tag: str, name: str) -> None:
+        """EF 管线各写入点的有限性追踪，UDTCA_DIAG_TRACE=1 打开，只在命中时打印。
+
+        目的：把「非有限值第一次出现在哪一步」夹出来——
+        A 打包前原始梯度 / B 打包加 err 之后 / C all-reduce 之后 / D 写回之后。
+        只读，不改任何控制流。
+        """
+        if os.environ.get("UDTCA_DIAG_TRACE", "0") != "1":
+            return
+        if os.environ.get("UDTCA_DIAG_TRACE_PARAM", "embed_tokens") not in name:
+            return
+        try:
+            bad, nan, inf, amax = self._tally_(flat)
+            if bad:
+                print(
+                    f"[diag][trace] rank={_dbg_rank_()} "
+                    f"mb={self.micro_batch_counter}/{self.micro_batch_size} "
+                    f"tag={tag} name={name} nonfinite={bad} nan={nan} "
+                    f"inf={inf} amax={amax:.6g}",
+                    flush=True,
+                )
+        except Exception as exc:      # 追踪不能影响训练
+            print(f"[diag][trace] failed tag={tag}: {exc!r}", flush=True)
+
     @torch.no_grad()
     def _probe_raw_grad_(self) -> None:
         """诊断：在每个 micro-batch 入口扫描「EF 打包之前」的原始 autograd 累积梯度。
@@ -1980,23 +1979,30 @@ class PolarGpipeLowMemoryErrorFeedbackHook:
                 g = self._local_grad(p)
                 if g is None:
                     continue
-                n_bad = self._count_nonfinite_(g.reshape(-1))
+                n_bad, n_nan, n_inf, g_amax = self._tally_(g.reshape(-1))
                 err = self.errors[i] if i < len(self.errors) else None
                 n_bad_err = -1
+                e_amax = -1.0
                 if err is not None:
-                    n_bad_err = self._count_nonfinite_(err.reshape(-1))
+                    n_bad_err, _, _, e_amax = self._tally_(err.reshape(-1))
                 acc = self._probe_acc.get(name)
                 if acc is None:
-                    acc = self._probe_acc[name] = [0, 0, 0]
+                    acc = self._probe_acc[name] = [0, 0, 0, 0.0]
                 acc[0] = max(acc[0], n_bad)
                 acc[1] = max(acc[1], n_bad_err)
                 acc[2] += 1
+                acc[3] = max(acc[3], e_amax)
                 if verbose or n_bad or n_bad_err > 0:
+                    # 命中时才扫权重本身：若权重行已经是 NaN，反传必然产出 NaN 梯度
+                    w_flat = self._local_tensor(p.data).reshape(-1)
+                    w_bad, _, _, w_amax = self._tally_(w_flat)
                     print(
                         f"[diag][rawgrad] rank={_dbg_rank_()} mb="
                         f"{self.micro_batch_counter}/{self.micro_batch_size} "
-                        f"name={name} grad_nonfinite={n_bad} "
-                        f"err_nonfinite={n_bad_err}",
+                        f"name={name} grad_nonfinite={n_bad} nan={n_nan} "
+                        f"inf={n_inf} grad_amax={g_amax:.6g} "
+                        f"err_nonfinite={n_bad_err} err_amax={e_amax:.6g} "
+                        f"w_nonfinite={w_bad} w_amax={w_amax:.6g}",
                         flush=True,
                     )
         except Exception as exc:      # 探针不能影响训练
@@ -2006,10 +2012,11 @@ class PolarGpipeLowMemoryErrorFeedbackHook:
         """每个 step 结束打一行汇总：整个 step 里「打包前的原始梯度」最大坏元素数。"""
         if not self._probe_acc:
             return
-        for name, (gmax, emax, nmb) in self._probe_acc.items():
+        for name, (gmax, emax, nmb, eabs) in self._probe_acc.items():
             print(
                 f"[diag][rawgrad] rank={_dbg_rank_()} STEP_SUMMARY name={name} "
-                f"mbs={nmb} max_grad_nonfinite={gmax} max_err_nonfinite={emax}",
+                f"mbs={nmb} max_grad_nonfinite={gmax} max_err_nonfinite={emax} "
+                f"max_err_amax={eabs:.6g}",
                 flush=True,
             )
         self._probe_acc = {}
@@ -2130,12 +2137,16 @@ class PolarGpipeLowMemoryErrorFeedbackHook:
                 self.errors[entry.param_idx] = err
 
             err_flat = err.reshape(-1)
+            name = self._param_name_(entry.param_idx)
             if grad is None:
                 dst.copy_(err_flat[entry.start: entry.start + entry.length])
             else:
                 grad_flat = grad.reshape(-1)
-                dst.copy_(grad_flat[entry.start: entry.start + entry.length])
+                src = grad_flat[entry.start: entry.start + entry.length]
+                self._trace_flat_(src, "A_pack_src_grad", name)
+                dst.copy_(src)
                 dst.add_(err_flat[entry.start: entry.start + entry.length])
+            self._trace_flat_(dst, "B_pack_dst_after_add", name)
 
             # Seed residual with -sent. Later microbatches continue to
             # accumulate into param.grad; at step end we add final local grad.
@@ -2651,6 +2662,12 @@ class PolarGpipeLowMemoryErrorFeedbackHook:
                 p = self.params[entry.param_idx]
                 err = self.errors[entry.param_idx]
                 grad = self._local_grad(p)
+                name = self._param_name_(entry.param_idx)
+                self._trace_flat_(
+                    device_buffer[offset: offset + entry.length],
+                    "C_after_allreduce",
+                    name,
+                )
                 if err is not None and grad is not None:
                     err_flat = err.reshape(-1)
                     grad_flat = grad.reshape(-1)
@@ -2659,9 +2676,21 @@ class PolarGpipeLowMemoryErrorFeedbackHook:
                     )
 
                 out_grad = self._ensure_local_grad_(p, entry.param_idx)
-                out_grad.reshape(-1)[entry.start: entry.start + entry.length].copy_(
+                out_flat = out_grad.reshape(-1)
+                out_flat[entry.start: entry.start + entry.length].copy_(
                     device_buffer[offset: offset + entry.length]
                 )
+                self._trace_flat_(
+                    out_flat[entry.start: entry.start + entry.length],
+                    "D_after_writeback_grad",
+                    name,
+                )
+                if err is not None:
+                    self._trace_flat_(
+                        err.reshape(-1)[entry.start: entry.start + entry.length],
+                        "D_after_writeback_err",
+                        name,
+                    )
                 offset += entry.length
 
         self.offloaded_pred_buckets = None
