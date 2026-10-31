@@ -1842,6 +1842,7 @@ class PolarGpipeLowMemoryErrorFeedbackHook:
         self.next_pred_bucket_idx: Optional[int] = None
         self._probe_names: Optional[List[str]] = None
         self._probe_acc: dict = {}
+        self._probe_reported = False
         self.launch_buckets_per_hook = max(
             1,
             int(os.environ.get("POLAR_EF_LOWMEM_LAUNCH_BUCKETS_PER_HOOK", "1")),
@@ -1959,6 +1960,19 @@ class PolarGpipeLowMemoryErrorFeedbackHook:
         try:
             if self._probe_names is None:
                 self._probe_names = [n for n, _ in self.model.named_parameters()]
+            if not self._probe_reported:
+                # 一次性自检：探针到底是"没匹配上"还是"grad 全 None"——两者都会静默
+                self._probe_reported = True
+                names = self._probe_names or []
+                matched = [n for n in names if pat in n]
+                n_grad = sum(1 for q in self.params if q.grad is not None)
+                print(
+                    f"[diag][probe] rank={_dbg_rank_()} pat={pat} "
+                    f"n_params={len(self.params)} n_names={len(names)} "
+                    f"matched={matched[:4]} grad_nonnull={n_grad} "
+                    f"first_names={names[:3]}",
+                    flush=True,
+                )
             for i, p in enumerate(self.params):
                 name = self._probe_names[i] if i < len(self._probe_names) else str(i)
                 if pat not in name:
