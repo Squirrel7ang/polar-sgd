@@ -1421,6 +1421,8 @@ class PolarParallel:
                 f"不跳过 optimizer.step / barrier）"
             )
             print(line, flush=True)
+            if os.environ.get("UDTCA_DIAG_BADGRAD_IDX", "0") == "1":
+                self._diag_bad_grad_index(gflat, bad_name, tag)
             if outdir:
                 os.makedirs(outdir, exist_ok=True)
                 with open(os.path.join(outdir, "bad_grad.txt"), "a") as fh:
@@ -1433,6 +1435,65 @@ class PolarParallel:
                 )
         except Exception as exc:  # 诊断失败不能影响训练
             print(f"[diag] bad_grad dump failed: {exc!r}", flush=True)
+
+    @torch.no_grad()
+    def _diag_bad_grad_index(self, flat: torch.Tensor, bad_name: str, tag: str) -> None:
+        """打印坏元素的下标分布（只在 UDTCA_DIAG_BADGRAD_IDX=1 且命中时跑）。
+
+        目的：把坏段的 [start, end) 和 ef_lowmem 的桶边界（bucket_numel）对齐，
+        判断脏数据是"整段桶没被写"还是"散乱随机坏"。
+        """
+        try:
+            dev = flat.device
+            parts = []
+            for off in range(0, flat.numel(), self._GRAD_SCAN_CHUNK):
+                seg = flat[off: off + self._GRAD_SCAN_CHUNK]
+                bad = (~torch.isfinite(seg)).nonzero().squeeze(1)
+                if bad.numel():
+                    parts.append(bad + off)
+            if not parts:
+                return
+            idx = torch.cat(parts)
+            n = int(idx.numel())
+            gaps = idx[1:] - idx[:-1]
+            brk = gaps > 1
+            starts = torch.cat([idx[:1], idx[1:][brk]])
+            ends = torch.cat([idx[1:][brk], idx[-1:]])
+            lens = ends - starts + 1
+            order = torch.argsort(lens, descending=True)[:5]
+            if dev.type == "cuda":
+                torch.cuda.synchronize(dev)
+            head = idx[:8].cpu().tolist()
+            tail = idx[-8:].cpu().tolist()
+            n_runs = int(starts.numel())
+            first3 = list(zip(starts[:3].cpu().tolist(), ends[:3].cpu().tolist(),
+                              lens[:3].cpu().tolist()))
+            top_runs = list(zip(idx[order].cpu().tolist(), lens[order].cpu().tolist()))
+            # 位模式统计：未初始化内存通常只有少数几种位模式（0x7F80/0xFF80/0x7FC0…）
+            bits_txt = ""
+            if flat.dtype in (torch.bfloat16, torch.float16):
+                with torch.no_grad():
+                    raw = flat[idx].contiguous().view(torch.int16)
+                    uniq, cnt = torch.unique(raw, return_counts=True)
+                    if uniq.numel() > 8:
+                        sel = torch.argsort(cnt, descending=True)[:8]
+                        uniq, cnt = uniq[sel], cnt[sel]
+                    if dev.type == "cuda":
+                        torch.cuda.synchronize(dev)
+                    pats = [f"0x{int(u) & 0xFFFF:04X}x{int(c)}"
+                            for u, c in zip(uniq.cpu().tolist(), cnt.cpu().tolist())]
+                bits_txt = f" bit_patterns={pats}"
+            print(
+                f"[diag][bad_idx] rank={dist.get_rank()} stage={self.stage_idx} "
+                f"tag={tag} name={bad_name} len={flat.numel()} n_bad={n} "
+                f"min={head[0]} max={tail[-1]} runs={n_runs} "
+                f"first8={head} last8={tail} "
+                f"first3_runs=[(start,end,len)={first3}] "
+                f"top_runs[(start,len)]={top_runs}{bits_txt}",
+                flush=True,
+            )
+        except Exception as exc:
+            print(f"[diag] bad_idx failed: {exc!r}", flush=True)
 
     def _has_nonfinite_grads(self, module: torch.nn.Module) -> bool:
         return self._find_nonfinite_grad(module) is not None

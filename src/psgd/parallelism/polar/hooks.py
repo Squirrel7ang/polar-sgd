@@ -1840,6 +1840,8 @@ class PolarGpipeLowMemoryErrorFeedbackHook:
         self.offloaded_pred_buckets: Optional[List[_OffloadedBucket]] = None
         self.pending_pred_buckets: Optional[List[_InflightBucket]] = None
         self.next_pred_bucket_idx: Optional[int] = None
+        self._probe_names: Optional[List[str]] = None
+        self._probe_acc: dict = {}
         self.launch_buckets_per_hook = max(
             1,
             int(os.environ.get("POLAR_EF_LOWMEM_LAUNCH_BUCKETS_PER_HOOK", "1")),
@@ -1929,6 +1931,74 @@ class PolarGpipeLowMemoryErrorFeedbackHook:
         if param.grad is None:
             return None
         return self._local_tensor(param.grad)
+
+    _PROBE_CHUNK = 8 * 1024 * 1024
+
+    @torch.no_grad()
+    def _count_nonfinite_(self, flat: torch.Tensor) -> int:
+        cnt = torch.zeros((), device=flat.device, dtype=torch.int64)
+        for off in range(0, flat.numel(), self._PROBE_CHUNK):
+            seg = flat[off: off + self._PROBE_CHUNK]
+            cnt += seg.numel() - torch.isfinite(seg).sum(dtype=torch.int64)
+        if flat.device.type == "cuda":
+            torch.cuda.synchronize(flat.device)
+        return int(cnt)
+
+    @torch.no_grad()
+    def _probe_raw_grad_(self) -> None:
+        """诊断：在每个 micro-batch 入口扫描「EF 打包之前」的原始 autograd 累积梯度。
+
+        UDTCA_DIAG_PROBE_PARAM=<参数名子串> 打开。目的：把"上游算出来的梯度"和
+        "EF 管线搬回来的梯度"分开——上游若先坏，打包/offload 就不是元凶。
+        顺带扫同一参数的 error 残差（它从第一步开始逐 mb 累积）。
+        """
+        pat = os.environ.get("UDTCA_DIAG_PROBE_PARAM", "")
+        if not pat:
+            return
+        verbose = os.environ.get("UDTCA_DIAG_PROBE_VERBOSE", "0") == "1"
+        try:
+            if self._probe_names is None:
+                self._probe_names = [n for n, _ in self.model.named_parameters()]
+            for i, p in enumerate(self.params):
+                name = self._probe_names[i] if i < len(self._probe_names) else str(i)
+                if pat not in name:
+                    continue
+                g = self._local_grad(p)
+                if g is None:
+                    continue
+                n_bad = self._count_nonfinite_(g.reshape(-1))
+                err = self.errors[i] if i < len(self.errors) else None
+                n_bad_err = -1
+                if err is not None:
+                    n_bad_err = self._count_nonfinite_(err.reshape(-1))
+                acc = self._probe_acc.get(name)
+                if acc is None:
+                    acc = self._probe_acc[name] = [0, 0, 0]
+                acc[0] = max(acc[0], n_bad)
+                acc[1] = max(acc[1], n_bad_err)
+                acc[2] += 1
+                if verbose or n_bad or n_bad_err > 0:
+                    print(
+                        f"[diag][rawgrad] rank={_dbg_rank_()} mb="
+                        f"{self.micro_batch_counter}/{self.micro_batch_size} "
+                        f"name={name} grad_nonfinite={n_bad} "
+                        f"err_nonfinite={n_bad_err}",
+                        flush=True,
+                    )
+        except Exception as exc:      # 探针不能影响训练
+            print(f"[diag][rawgrad] failed: {exc!r}", flush=True)
+
+    def _probe_flush_(self) -> None:
+        """每个 step 结束打一行汇总：整个 step 里「打包前的原始梯度」最大坏元素数。"""
+        if not self._probe_acc:
+            return
+        for name, (gmax, emax, nmb) in self._probe_acc.items():
+            print(
+                f"[diag][rawgrad] rank={_dbg_rank_()} STEP_SUMMARY name={name} "
+                f"mbs={nmb} max_grad_nonfinite={gmax} max_err_nonfinite={emax}",
+                flush=True,
+            )
+        self._probe_acc = {}
 
     def _ensure_local_grad_(self, param: torch.nn.Parameter, param_idx: int) -> torch.Tensor:
         grad = self._local_grad(param)
@@ -2600,6 +2670,7 @@ class PolarGpipeLowMemoryErrorFeedbackHook:
             f"active_prediction={active_prediction} "
             f"next_bucket={self.next_pred_bucket_idx}"
         )
+        self._probe_raw_grad_()
         try:
             self._progress_lowbit_backend_(block=False)
             self._drain_ready_pred_buckets_()
@@ -2651,6 +2722,7 @@ class PolarGpipeLowMemoryErrorFeedbackHook:
                     "ef_lowmem hook final path returned "
                     f"elapsed_ms={(time.perf_counter() - t_finish) * 1000.0:.3f}"
                 )
+                self._probe_flush_()
                 self._mark_dp_window_end()
                 self.micro_batch_counter = 0
                 self.comm_handle = None
