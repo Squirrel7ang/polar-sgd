@@ -786,6 +786,21 @@ class PolarParallel:
             flush=True,
         )
 
+    def _stage_attention_mask(self, stage, batch):
+        """搬 attention_mask 到设备，并先在 CPU 张量上判好"是否全 1"。
+
+        模型 forward 里若直接对**设备上的** mask 做 `bool(mask.all().item())`，
+        每个 microbatch、每个 stage 都会触发一次全卡同步，PP 的 1F1B overlap
+        当场被打断（32 卡 Qwen14B：每步 32 次）。这里改在 CPU 侧判断——输入
+        数值相同、结果完全一致，只是不再碰设备；forward 侧只读这个标志。
+        """
+        mask_cpu = batch["attention_mask"]
+        all_ones = None
+        if mask_cpu.dim() == 2 and mask_cpu.device.type == "cpu":
+            all_ones = bool(mask_cpu.all())
+        setattr(stage.submod, "_udtca_mask_all_ones", all_ones)
+        return mask_cpu.to(self.device)
+
     def _debug_batch(self, batch_idx: int, input_ids, labels, attention_mask) -> None:
         debug_steps = int(getattr(self.args, "debug_nan_steps", 0) or 0)
         if batch_idx >= debug_steps:
@@ -1541,7 +1556,7 @@ class PolarParallel:
                 break
 
             input_ids = batch["input_ids"].to(self.device)
-            attention_mask = batch["attention_mask"].to(self.device)
+            attention_mask = self._stage_attention_mask(self.stage, batch)
             labels = batch["labels"].to(self.device) if is_last else None
 
             if self.stage.is_first:
@@ -1798,15 +1813,25 @@ class PolarParallel:
                 )
         self._rt_enabled = self._rt_enabled and self._rt_pp_start is not None
 
-        # profiler 推迟到第一步跑完之后再进：第一条 schedule.step() 里会做
+        # profiler 推迟到前几步跑完之后再进：第一条 schedule.step() 里会做
         # **一次性**的 PP 初始化（warm-up 投票链 + metadata forward/backward），
-        # CUPTI 正在采集时跑这段裸 P2P 曾整条链挂死。这里不调用 torch 的任何
-        # 内部接口，第一步走的就是原始的 step() 路径，只是把 profiler 的起点
-        # 后移一步（wait/warmup/active 相对起点计数，因此整体后移一步）。
+        # CUPTI 正在采集时跑这段裸 P2P 曾整条链挂死。前几步走的是原始的 step()
+        # 路径，起点由 --profiler-start-step（0 基）控制，wait/warmup/active
+        # 相对这个起点计数。
+        profiler_start_step = max(int(getattr(self.args, "profiler_start_step", 1)), 0)
         prof = None
         with contextlib.ExitStack() as profiler_stack:
             for batch_idx, batch in enumerate(pbar):
-                if prof is None and batch_idx >= 1:
+                if prof is None and batch_idx >= profiler_start_step:
+                    print(
+                        f"[profiler] rank={dist.get_rank()} stage={self.stage_idx} "
+                        f"enter_before_batch={batch_idx} "
+                        f"disable={self._as_bool(getattr(self.args, 'disable_profiler', False))} "
+                        f"wait={getattr(self.args, 'profiler_wait_steps', None)} "
+                        f"warmup={getattr(self.args, 'profiler_warmup_steps', None)} "
+                        f"active={getattr(self.args, 'profiler_active_steps', None)}",
+                        flush=True,
+                    )
                     prof = profiler_stack.enter_context(
                         self._profiler_context(self.tensorboard_trace_dir)
                     )
@@ -1821,7 +1846,7 @@ class PolarParallel:
                     if self.stage.is_last
                     else None
                 )
-                attention_mask = batch["attention_mask"].to(self.device)
+                attention_mask = self._stage_attention_mask(self.stage, batch)
                 # 多模态等额外输入（pixel_values / image_grid_thw ...）原样透传给各 stage
                 # 的 forward。纯文本 batch 不含这些 key，extra_inputs 为空，行为与以前一致。
                 extra_inputs = {
@@ -2164,7 +2189,7 @@ class PolarParallel:
                     if baseline_stage.is_last
                     else None
                 )
-                attention_mask = batch["attention_mask"].to(self.device)
+                attention_mask = self._stage_attention_mask(baseline_stage, batch)
                 self._debug_batch(batch_idx, input_ids, labels, attention_mask)
 
                 optimizer.zero_grad(set_to_none=True)
