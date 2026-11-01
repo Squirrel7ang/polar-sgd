@@ -5,7 +5,6 @@ import argparse
 import logging
 import contextlib
 import csv
-import itertools
 import time
 import threading
 # from turtle import back
@@ -1589,43 +1588,6 @@ class PolarParallel:
         self.stage.submod.train()
         return avg_loss, ppl
 
-    def _preinit_pipeline_stage(self, batch) -> None:
-        """在 profiler 之外提前完成 pipeline stage 的一次性初始化。
-
-        等价于第一次 ``schedule.step()`` 里那次 ``_initialize_pp_stages``：
-        跑一遍 PP 的 warm-up 投票链和 metadata forward/backward，把收/发缓冲区
-        和形状信息建好。它是幂等的，真正的 ``step()`` 会看到标志位已置位而跳过。
-        """
-        schedule = getattr(self, "schedule", None)
-        if schedule is None or not hasattr(schedule, "_initialize_stage"):
-            # 老版本 torch 没有这个内部接口，退回原来的行为。
-            return
-        input_ids = batch["input_ids"].to(self.device)
-        labels = batch["labels"].to(self.device) if self.stage.is_last else None
-        attention_mask = batch["attention_mask"].to(self.device)
-        extra_inputs = {
-            key: value.to(self.device)
-            for key, value in batch.items()
-            if key not in _RESERVED_BATCH_KEYS
-            and isinstance(value, torch.Tensor)
-        }
-        kwargs = {"attention_mask": attention_mask, **extra_inputs}
-
-        # 必须和 schedule.step() 内部完全一致：先把整批切成 n_microbatches 份，
-        # 再拿**第 0 个微批**去初始化。直接传整批会让 metadata forward 按整批
-        # 形状推导，和真正 step 用的微批形状对不上
-        # （RuntimeError: Mismatch in shape: grad_output[0] ... vs output[0] ...）。
-        split = getattr(schedule, "_split_inputs", None)
-        if split is None:
-            return
-        args = (input_ids,) if self.stage.is_first else ()
-        arg_mbs, kwarg_mbs = split(args, kwargs)
-        first_target = None
-        if labels is not None:
-            target_mbs, _ = split((labels,), {})
-            first_target = target_mbs[0]
-        schedule._initialize_stage(arg_mbs[0], kwarg_mbs[0], first_target)
-
     def train(self):
         using_polar = self._as_bool(getattr(self.args, "using_polar", True))
         # Register hook only if not using Local-SGD (Polar gradient prediction)
@@ -1836,22 +1798,18 @@ class PolarParallel:
                 )
         self._rt_enabled = self._rt_enabled and self._rt_pp_start is not None
 
-        # 把 pipeline stage 的一次性初始化（_warmup_p2p 的裸 send/recv 投票链 +
-        # metadata forward）挪到 profiler **外面**先用第一个 batch 做掉。
-        # 这段原先是包在 torch.profiler 上下文里的（第一次 schedule.step 触发），
-        # CUPTI 正在采集时跑裸 P2P 曾出现整条链永久挂死；而且一旦它和后面那次
-        # TP all_reduce 交错，就形成前面说的交叉等待。
-        # _initialize_stage 是幂等的：step() 里看到 forward/backward 标志位已置位
-        # 就直接返回，所以 profiler 的 wait/warmup/active 语义完全不变。
-        loop_iter = pbar
-        pbar_iter = iter(pbar)
-        first_batch = next(pbar_iter, None)
-        if first_batch is not None:
-            self._preinit_pipeline_stage(first_batch)
-            loop_iter = itertools.chain([first_batch], pbar_iter)
-
-        with self._profiler_context(self.tensorboard_trace_dir) as prof:
-            for batch_idx, batch in enumerate(loop_iter):
+        # profiler 推迟到第一步跑完之后再进：第一条 schedule.step() 里会做
+        # **一次性**的 PP 初始化（warm-up 投票链 + metadata forward/backward），
+        # CUPTI 正在采集时跑这段裸 P2P 曾整条链挂死。这里不调用 torch 的任何
+        # 内部接口，第一步走的就是原始的 step() 路径，只是把 profiler 的起点
+        # 后移一步（wait/warmup/active 相对起点计数，因此整体后移一步）。
+        prof = None
+        with contextlib.ExitStack() as profiler_stack:
+            for batch_idx, batch in enumerate(pbar):
+                if prof is None and batch_idx >= 1:
+                    prof = profiler_stack.enter_context(
+                        self._profiler_context(self.tensorboard_trace_dir)
+                    )
                 if max_steps is not None and batch_idx >= int(max_steps):
                     break
                 step_t0 = time.perf_counter()
@@ -2004,7 +1962,8 @@ class PolarParallel:
                             f"loss={val_loss:.4f} ppl={val_ppl:.2f}"
                         )
 
-                prof.step()
+                if prof is not None:
+                    prof.step()
 
                 if self.stage.is_last:
                     torch.cuda.synchronize(self.device)
