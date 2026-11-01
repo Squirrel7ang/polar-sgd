@@ -5,6 +5,7 @@ import argparse
 import logging
 import contextlib
 import csv
+import itertools
 import time
 import threading
 # from turtle import back
@@ -353,6 +354,15 @@ class PolarParallel:
             device=self.device,
             group=self.pp_mesh.get_group(),
         )
+
+        # 同一 stage 的 tp0/tp1 必须同时进入训练主循环。
+        # PP 的 warm-up 投票是一条**严格串行**的 ring（stage0 -> ... -> stageN），
+        # 而紧随其后的 metadata forward 里要做 TP 的 all_reduce：
+        # 若某个分片已经进了 TP 集合通信、它的 tp 兄弟还停在初始化里（DP 根广播、
+        # 参数检查等），就形成 "TP all_reduce 等 tp 兄弟" × "PP ring 等本 stage"
+        # 的交叉等待，整机永久挂住。这里用一次 TP barrier 把两个分片对齐。
+        if self.tp_mesh is not None and self.tp_mesh.size() > 1:
+            dist.barrier(group=self.tp_mesh.get_group())
 
         # Only construct DDP wrapper when explicitly requested.
         self.ddp_model = None
@@ -1005,11 +1015,42 @@ class PolarParallel:
             # init_device_mesh uses row-major ranks for the (dp, pp) mesh.
             src_rank = self.stage_idx
 
-        for param in self.stage_model.parameters():
-            tensor = param.data
-            if hasattr(tensor, "to_local"):
-                tensor = tensor.to_local()
-            dist.broadcast(tensor, src=src_rank, group=dp_group)
+        # 先对齐"广播什么"的清单，再广播数据。
+        # 这段是一串**长度和尺寸都不固定**的集合通信：两端只要差一个参数或
+        # 一个分片形状，NCCL 不会报错，只会永久阻塞。而它跑在 PipelineStage
+        # 构造之前，一旦卡住，本 stage 就永远不进入 PP 投票（_warmup_p2p 是一条
+        # 严格串行的 ring），整条 PP 链被拖死，紧接着的 metadata forward 里
+        # 的 TP all_reduce 又必须等本 stage 的兄弟分片 —— 交叉等待成环。
+        # 所以这里先做一次校验，不一致就立刻抛错，而不是安静地挂住。
+        params = sorted(self.stage_model.named_parameters(), key=lambda kv: kv[0])
+        manifest = []
+        for name, param in params:
+            data = param.data
+            if hasattr(data, "to_local"):
+                data = data.to_local()
+            manifest.append((name, tuple(data.shape), str(data.dtype)))
+        gathered: list = [None] * dist.get_world_size(dp_group)
+        dist.all_gather_object(gathered, manifest, group=dp_group)
+        if any(other != manifest for other in gathered):
+            raise RuntimeError(
+                f"[polar] stage {self.stage_idx} 的 DP 副本参数清单不一致，"
+                f"继续广播会死锁；已在广播前中止。各副本是否一致: "
+                f"{[other == manifest for other in gathered]}"
+            )
+
+        # 按名字排序后再广播，保证两端调用的**顺序**也一致。
+        for _name, param in params:
+            data = param.data
+            if hasattr(data, "to_local"):
+                data = data.to_local()
+            if data.is_contiguous():
+                dist.broadcast(data, src=src_rank, group=dp_group)
+            else:
+                # 非连续 / 有重叠 storage 的分片直接广播是不安全的，先拷到
+                # 连续临时区再写回。每次只多一个参数的内存。
+                tmp = data.contiguous()
+                dist.broadcast(tmp, src=src_rank, group=dp_group)
+                data.copy_(tmp)
 
         # Buffers can diverge across TP-local module transforms (for example
         # RoPE/cache buffers), which makes DP peers issue a different number of
@@ -1548,6 +1589,34 @@ class PolarParallel:
         self.stage.submod.train()
         return avg_loss, ppl
 
+    def _preinit_pipeline_stage(self, batch) -> None:
+        """在 profiler 之外提前完成 pipeline stage 的一次性初始化。
+
+        等价于第一次 ``schedule.step()`` 里那次 ``_initialize_pp_stages``：
+        跑一遍 PP 的 warm-up 投票链和 metadata forward/backward，把收/发缓冲区
+        和形状信息建好。它是幂等的，真正的 ``step()`` 会看到标志位已置位而跳过。
+        """
+        schedule = getattr(self, "schedule", None)
+        if schedule is None or not hasattr(schedule, "_initialize_stage"):
+            # 老版本 torch 没有这个内部接口，退回原来的行为。
+            return
+        input_ids = batch["input_ids"].to(self.device)
+        labels = batch["labels"].to(self.device) if self.stage.is_last else None
+        attention_mask = batch["attention_mask"].to(self.device)
+        extra_inputs = {
+            key: value.to(self.device)
+            for key, value in batch.items()
+            if key not in _RESERVED_BATCH_KEYS
+            and isinstance(value, torch.Tensor)
+        }
+        kwargs = {"attention_mask": attention_mask, **extra_inputs}
+        if self.stage.is_first:
+            schedule._initialize_stage((input_ids,), kwargs)
+        elif self.stage.is_last:
+            schedule._initialize_stage((), kwargs, target=labels)
+        else:
+            schedule._initialize_stage((), kwargs)
+
     def train(self):
         using_polar = self._as_bool(getattr(self.args, "using_polar", True))
         # Register hook only if not using Local-SGD (Polar gradient prediction)
@@ -1758,8 +1827,22 @@ class PolarParallel:
                 )
         self._rt_enabled = self._rt_enabled and self._rt_pp_start is not None
 
+        # 把 pipeline stage 的一次性初始化（_warmup_p2p 的裸 send/recv 投票链 +
+        # metadata forward）挪到 profiler **外面**先用第一个 batch 做掉。
+        # 这段原先是包在 torch.profiler 上下文里的（第一次 schedule.step 触发），
+        # CUPTI 正在采集时跑裸 P2P 曾出现整条链永久挂死；而且一旦它和后面那次
+        # TP all_reduce 交错，就形成前面说的交叉等待。
+        # _initialize_stage 是幂等的：step() 里看到 forward/backward 标志位已置位
+        # 就直接返回，所以 profiler 的 wait/warmup/active 语义完全不变。
+        loop_iter = pbar
+        pbar_iter = iter(pbar)
+        first_batch = next(pbar_iter, None)
+        if first_batch is not None:
+            self._preinit_pipeline_stage(first_batch)
+            loop_iter = itertools.chain([first_batch], pbar_iter)
+
         with self._profiler_context(self.tensorboard_trace_dir) as prof:
-            for batch_idx, batch in enumerate(pbar):
+            for batch_idx, batch in enumerate(loop_iter):
                 if max_steps is not None and batch_idx >= int(max_steps):
                     break
                 step_t0 = time.perf_counter()
