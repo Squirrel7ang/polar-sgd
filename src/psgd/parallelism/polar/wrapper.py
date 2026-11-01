@@ -1610,12 +1610,21 @@ class PolarParallel:
             and isinstance(value, torch.Tensor)
         }
         kwargs = {"attention_mask": attention_mask, **extra_inputs}
-        if self.stage.is_first:
-            schedule._initialize_stage((input_ids,), kwargs)
-        elif self.stage.is_last:
-            schedule._initialize_stage((), kwargs, target=labels)
-        else:
-            schedule._initialize_stage((), kwargs)
+
+        # 必须和 schedule.step() 内部完全一致：先把整批切成 n_microbatches 份，
+        # 再拿**第 0 个微批**去初始化。直接传整批会让 metadata forward 按整批
+        # 形状推导，和真正 step 用的微批形状对不上
+        # （RuntimeError: Mismatch in shape: grad_output[0] ... vs output[0] ...）。
+        split = getattr(schedule, "_split_inputs", None)
+        if split is None:
+            return
+        args = (input_ids,) if self.stage.is_first else ()
+        arg_mbs, kwarg_mbs = split(args, kwargs)
+        first_target = None
+        if labels is not None:
+            target_mbs, _ = split((labels,), {})
+            first_target = target_mbs[0]
+        schedule._initialize_stage(arg_mbs[0], kwarg_mbs[0], first_target)
 
     def train(self):
         using_polar = self._as_bool(getattr(self.args, "using_polar", True))
