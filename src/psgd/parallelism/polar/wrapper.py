@@ -537,6 +537,11 @@ class PolarParallel:
         impl = getattr(self, "_polar_hook_impl", None)
         dp_start = getattr(impl, "dp_window_start_evt", None)
         dp_end = getattr(impl, "dp_window_end_evt", None)
+        if dp_start is None or dp_end is None:
+            # baseline / bitscom 不走 polar hook，DP 同步窗口由 train() 自己用
+            # 事件框住（见 _allreduce_dp_grads_ 调用点）。
+            dp_start = getattr(self, "_rt_dp_start", None)
+            dp_end = getattr(self, "_rt_dp_end", None)
         dp_s = pp_s = overtime = None
         try:
             # 这个后端上不先 synchronize，cudaEventElapsedTime 会返回
@@ -1784,33 +1789,44 @@ class PolarParallel:
         grad_clip_norm = float(getattr(self.args, "grad_clip_norm", 1.0))
         run_t0 = time.perf_counter()
 
-        # 运行时每步指标（仅 polar）：DP-PP 重叠率 + DP 通信量降低量。
-        # 在固定 rank（最后一个 stage、dp 局部 rank 0，即 node0）打印一行结构化
-        # metric，供平台实时监测；baseline 不打印。
+        # 运行时每步指标：DP-PP 重叠率 + DP 通信量降低量。在固定 rank
+        # （最后一个 stage、dp 局部 rank 0、tp 局部 rank 0，即 node0）打印一行
+        # 结构化 metric，供平台实时监测。
+        #
+        # baseline / bitscom 也测：它们的 DP 同步是 1F1B 之后**串行**做的，
+        # 窗口由 wrapper 自己记录，重叠率按构造就是 0% —— 这正是想要的对照
+        # （polar 的收益就体现在这一项上）。POLAR_RT_METRICS=0 可关掉。
         self._rt_metric_rank = bool(
             self.stage.is_last
             and self.dp_mesh.get_local_rank() == 0
             and (self.tp_mesh is None or self.tp_mesh.get_local_rank() == 0)
         )
-        self._rt_enabled = (
-            using_polar
-            and self._rt_metric_rank
+        self._rt_enabled = bool(
+            self._rt_metric_rank
             and torch.cuda.is_available()
             and os.environ.get("POLAR_RT_METRICS", "1").lower()
             not in {"0", "false", "no", "off"}
         )
-        self._rt_any_rank = using_polar and torch.cuda.is_available()
+        self._rt_any_rank = torch.cuda.is_available() and (
+            using_polar or self.baseline_mode in ("manual", "ddp")
+        )
         self._rt_pp_start = None
         self._rt_pp_end = None
+        self._rt_dp_start = None
+        self._rt_dp_end = None
         if self._rt_any_rank:
+            self._rt_pp_start = torch.cuda.Event(enable_timing=True)
+            self._rt_pp_end = torch.cuda.Event(enable_timing=True)
             impl = getattr(self, "_polar_hook_impl", None)
             if impl is not None and hasattr(impl, "attach_dp_window_events"):
-                self._rt_pp_start = torch.cuda.Event(enable_timing=True)
-                self._rt_pp_end = torch.cuda.Event(enable_timing=True)
                 impl.attach_dp_window_events(
                     torch.cuda.Event(enable_timing=True),
                     torch.cuda.Event(enable_timing=True),
                 )
+            else:
+                # 没有 polar hook：DP 窗口自己记（baseline 的串行 all-reduce）
+                self._rt_dp_start = torch.cuda.Event(enable_timing=True)
+                self._rt_dp_end = torch.cuda.Event(enable_timing=True)
         self._rt_enabled = self._rt_enabled and self._rt_pp_start is not None
 
         # profiler 推迟到前几步跑完之后再进：第一条 schedule.step() 里会做
@@ -1847,6 +1863,9 @@ class PolarParallel:
                     else None
                 )
                 attention_mask = self._stage_attention_mask(self.stage, batch)
+                # pp=1 时 first/last 是同一个 stage，走 first 分支不会赋 mean_loss，
+                # 而 [rt-metric] 里要读它 —— 先给个默认值。
+                mean_loss = None
                 # 多模态等额外输入（pixel_values / image_grid_thw ...）原样透传给各 stage
                 # 的 forward。纯文本 batch 不含这些 key，extra_inputs 为空，行为与以前一致。
                 extra_inputs = {
@@ -1907,7 +1926,7 @@ class PolarParallel:
                     f"is_first={self.stage.is_first} "
                     f"is_last={self.stage.is_last} schedule.step exit"
                 )
-                if self._rt_enabled:
+                if self._rt_enabled and using_polar:
                     self._emit_rt_metric(
                         global_step,
                         mean_loss=mean_loss,
@@ -1918,9 +1937,20 @@ class PolarParallel:
                     # DP synchronization at the usual DDP point, after 1F1B
                     # backward has completed for this pipeline stage. Only the
                     # transport changes when lowbit_group is present.
+                    if self._rt_dp_start is not None:
+                        self._rt_dp_start.record()
                     self._allreduce_dp_grads_(
                         getattr(self, "lowbit_group", None)
                     )
+                    if self._rt_dp_end is not None:
+                        self._rt_dp_end.record()
+                    # DP 窗口已经记全，指标改到这里发（上面那次对 baseline 跳过）。
+                    if self._rt_enabled:
+                        self._emit_rt_metric(
+                            global_step,
+                            mean_loss=mean_loss,
+                            lowbit_group=getattr(self, "lowbit_group", None),
+                        )
 
                 # 梯度体检：扫描 + 记录 +（默认）就地清理。不改变控制流，
                 # 命中也照常做 clip / optimizer.step / step 边界 barrier。
