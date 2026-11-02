@@ -1219,12 +1219,8 @@ class PolarParallel:
             )
             return []
         if not bad:
-            if os.environ.get("UDTCA_GRADGUARD_LOG_OK", "0") == "1":
-                print(
-                    f"[gradguard] rank={rank} stage={self.stage_idx} "
-                    f"tag={tag} all_finite",
-                    flush=True,
-                )
+            # 一切正常就不打日志（原来由 UDTCA_GRADGUARD_LOG_OK=1 打 all_finite，
+            # 每步每 rank 一行，纯噪音）；只有扫出坏 grad 才输出。
             return bad
         for name, n_bad, absmax in bad:
             print(
@@ -1970,19 +1966,8 @@ class PolarParallel:
                 self.optimizer.step()
                 # 每轮参数更新完在进下一次 forward 之前做一次全局同步：
                 # 所有 rank 都完成本 iter 的 update 之后才允许开始下一 iter。
-                print(
-                    f"[diag][barrier] rank={dist.get_rank()} "
-                    f"stage={self.stage_idx} step={global_step} "
-                    f"batch={batch_idx} enter",
-                    flush=True,
-                )
+                # 注意：这里不再打 enter/exit 日志（每步每 rank 两行，纯噪音）。
                 dist.barrier()
-                print(
-                    f"[diag][barrier] rank={dist.get_rank()} "
-                    f"stage={self.stage_idx} step={global_step} "
-                    f"batch={batch_idx} exit",
-                    flush=True,
-                )
                 debug_steps = int(getattr(self.args, "debug_nan_steps", 0) or 0)
                 if global_step == 0 or batch_idx < debug_steps:
                     self._log_stage_memory_and_params(
