@@ -65,6 +65,9 @@ def _dbg_rank_() -> int:
 
 
 def _dbg(msg: str, site: str = "") -> None:
+    # 10/14 版本没有这些逐调用打印；profiler 对照实验默认静音，POLAR_DBG=1 才打。
+    if os.environ.get("POLAR_DBG", "0") != "1":
+        return
     print(
         f"[dbg {_wall_clock()} {time.monotonic() - _DBG_T0:9.3f}s rank={_dbg_rank_()} "
         f"lrank={os.environ.get('LOCAL_RANK', '?')} pid={os.getpid()}"
@@ -230,6 +233,10 @@ def _wait_work_with_timeout(work, tag: str) -> None:
     the process is never terminated from here.
     """
     if work is None:
+        return
+    # 10/14 版本就是一句阻塞 work.wait()；轮询只在 POLAR_WAIT_POLL=1 时启用。
+    if os.environ.get("POLAR_WAIT_POLL", "0") != "1":
+        work.wait()
         return
     timeout_s = _comm_call_timeout_s()
     deadline = time.monotonic() + timeout_s if timeout_s > 0 else None
